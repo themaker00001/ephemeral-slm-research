@@ -8,8 +8,32 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{compiler_fence, Ordering};
 
+/// Overwrite every byte of `data` with zero using volatile stores that the compiler may
+/// not elide, followed by a compiler fence.
+///
+/// This is the single zeroization primitive used by [`SecureBuffer`] and by the
+/// monolithic baseline's secure cleanup. It only covers the bytes of `data` itself:
+/// copies made earlier (registers, stack temporaries, allocator metadata, swap) are
+/// out of its reach.
+pub fn volatile_zero<T: Copy>(data: &mut [T]) {
+    if data.is_empty() {
+        return;
+    }
+    compiler_fence(Ordering::SeqCst);
+    let ptr = data.as_mut_ptr() as *mut u8;
+    let total_bytes = std::mem::size_of_val(data);
+    // SAFETY: `ptr` points to `total_bytes` initialized, writable bytes owned by `data`.
+    // Zero is written as raw bytes; `T: Copy` means no destructor can observe the value.
+    unsafe {
+        for i in 0..total_bytes {
+            std::ptr::write_volatile(ptr.add(i), 0u8);
+        }
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
 /// A memory buffer that guarantees secure zeroization upon drop or manual scrubbing.
-pub struct SecureBuffer<T> {
+pub struct SecureBuffer<T: Copy> {
     data: Vec<T>,
     is_scrubbed: bool,
 }
@@ -65,21 +89,7 @@ impl<T: Default + Copy> SecureBuffer<T> {
         if self.is_scrubbed || self.data.is_empty() {
             return;
         }
-
-        // Sequential consistency compiler fence before writes
-        compiler_fence(Ordering::SeqCst);
-
-        let ptr = self.data.as_mut_ptr() as *mut u8;
-        let total_bytes = self.size_bytes();
-
-        unsafe {
-            for i in 0..total_bytes {
-                std::ptr::write_volatile(ptr.add(i), 0u8);
-            }
-        }
-
-        // Sequential consistency compiler fence after writes to prevent hoisting
-        compiler_fence(Ordering::SeqCst);
+        volatile_zero(&mut self.data);
         self.is_scrubbed = true;
     }
 
@@ -103,7 +113,7 @@ impl<T: Default + Copy> SecureBuffer<T> {
     }
 }
 
-impl<T> Deref for SecureBuffer<T> {
+impl<T: Copy> Deref for SecureBuffer<T> {
     type Target = [T];
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -111,7 +121,7 @@ impl<T> Deref for SecureBuffer<T> {
     }
 }
 
-impl<T> DerefMut for SecureBuffer<T> {
+impl<T: Copy> DerefMut for SecureBuffer<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.is_scrubbed = false;
@@ -119,19 +129,11 @@ impl<T> DerefMut for SecureBuffer<T> {
     }
 }
 
-impl<T> Drop for SecureBuffer<T> {
+impl<T: Copy> Drop for SecureBuffer<T> {
     fn drop(&mut self) {
-        // Guaranteed zeroization on drop if not explicitly scrubbed earlier
-        if !self.is_scrubbed && !self.data.is_empty() {
-            compiler_fence(Ordering::SeqCst);
-            let ptr = self.data.as_mut_ptr() as *mut u8;
-            let total_bytes = self.data.len() * std::mem::size_of::<T>();
-            unsafe {
-                for i in 0..total_bytes {
-                    std::ptr::write_volatile(ptr.add(i), 0u8);
-                }
-            }
-            compiler_fence(Ordering::SeqCst);
+        // Zeroize on drop if not explicitly scrubbed earlier.
+        if !self.is_scrubbed {
+            volatile_zero(&mut self.data);
             self.is_scrubbed = true;
         }
     }

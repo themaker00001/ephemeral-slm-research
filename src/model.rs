@@ -7,7 +7,7 @@
 //!    reconstructed into transient `SecureBuffer`s on demand, executed, and immediately
 //!    scrubbed using volatile writes with compiler memory barriers.
 
-use crate::ephemeral::{EphemeralMetrics, SecureBuffer};
+use crate::ephemeral::{volatile_zero, EphemeralMetrics, SecureBuffer};
 use crate::telemetry::{get_process_rss_bytes, LifecycleEvent, TelemetryLogger};
 use crate::weights::{ModelConfig, PayloadView, EMBEDDED_MODEL_PAYLOAD};
 use std::time::Instant;
@@ -71,9 +71,11 @@ impl MathOps {
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         // Compute Q, K, V for each position
-        let mut q = vec![0.0_f32; seq_len * d_model];
-        let mut k = vec![0.0_f32; seq_len * d_model];
-        let mut v = vec![0.0_f32; seq_len * d_model];
+        // Scratch buffers derive directly from the weights and the input, so they are
+        // `SecureBuffer`s: they are volatile-zeroed when they go out of scope.
+        let mut q = SecureBuffer::<f32>::zeroed(seq_len * d_model);
+        let mut k = SecureBuffer::<f32>::zeroed(seq_len * d_model);
+        let mut v = SecureBuffer::<f32>::zeroed(seq_len * d_model);
 
         for t in 0..seq_len {
             let offset = t * d_model;
@@ -84,7 +86,7 @@ impl MathOps {
         }
 
         // Output buffer for multi-head attention before final projection
-        let mut attn_out = vec![0.0_f32; seq_len * d_model];
+        let mut attn_out = SecureBuffer::<f32>::zeroed(seq_len * d_model);
 
         // For each attention head
         for h in 0..n_heads {
@@ -96,7 +98,7 @@ impl MathOps {
                 let q_vec = &q[q_t_offset..q_t_offset + head_dim];
 
                 // Compute scores against all prior and current positions s <= t
-                let mut scores = Vec::with_capacity(t + 1);
+                let mut scores = SecureBuffer::<f32>::zeroed(t + 1);
                 let mut max_score = f32::NEG_INFINITY;
 
                 for s in 0..=t {
@@ -110,7 +112,7 @@ impl MathOps {
                     if score > max_score {
                         max_score = score;
                     }
-                    scores.push(score);
+                    scores[s] = score;
                 }
 
                 // Causal softmax
@@ -138,7 +140,7 @@ impl MathOps {
         }
 
         // Final linear projection and residual addition: x = x + wo * attn_out
-        let mut proj = vec![0.0_f32; d_model];
+        let mut proj = SecureBuffer::<f32>::zeroed(d_model);
         for t in 0..seq_len {
             let offset = t * d_model;
             Self::matvec(wo, &attn_out[offset..offset + d_model], &mut proj, d_model, d_model);
@@ -158,9 +160,9 @@ impl MathOps {
         w1: &[f32],
         w2: &[f32],
     ) {
-        let mut h = vec![0.0_f32; d_model];
-        let mut hidden = vec![0.0_f32; d_ff];
-        let mut out = vec![0.0_f32; d_model];
+        let mut h = SecureBuffer::<f32>::zeroed(d_model);
+        let mut hidden = SecureBuffer::<f32>::zeroed(d_ff);
+        let mut out = SecureBuffer::<f32>::zeroed(d_model);
 
         for t in 0..seq_len {
             let offset = t * d_model;
@@ -231,7 +233,7 @@ impl MonolithicSLM {
         for l in 0..cfg.n_layers {
             let ls = payload.get_layer_slices(l);
 
-            let mut norm1 = vec![0.0_f32; ls.norm1.data.len()];
+            let mut norm1 = vec![0.0_f32; ls.norm1.len()];
             ls.norm1.copy_into(&mut norm1);
 
             let mut wq = vec![0.0_f32; ls.wq.num_elements()];
@@ -246,7 +248,7 @@ impl MonolithicSLM {
             let mut wo = vec![0.0_f32; ls.wo.num_elements()];
             ls.wo.dequantize_into(&mut wo);
 
-            let mut norm2 = vec![0.0_f32; ls.norm2.data.len()];
+            let mut norm2 = vec![0.0_f32; ls.norm2.len()];
             ls.norm2.copy_into(&mut norm2);
 
             let mut w1 = vec![0.0_f32; ls.w1.num_elements()];
@@ -271,7 +273,7 @@ impl MonolithicSLM {
         }
 
         let (fn_slice, head_slice) = payload.get_final_slices();
-        let mut final_norm = vec![0.0_f32; fn_slice.data.len()];
+        let mut final_norm = vec![0.0_f32; fn_slice.len()];
         fn_slice.copy_into(&mut final_norm);
 
         let mut head = vec![0.0_f32; head_slice.num_elements()];
@@ -348,8 +350,12 @@ impl MonolithicSLM {
         logits
     }
 
-    /// Best-effort cleanup of monolithic buffers.
-    pub fn cleanup(&mut self) {
+    /// Naive cleanup: plain `fill(0.0)`, the method a typical program would use.
+    ///
+    /// The compiler is allowed to drop these stores as dead if the buffers are freed
+    /// right afterwards, so this gives no guarantee. Kept so the forensic scan can show
+    /// what the naive approach actually leaves behind.
+    pub fn cleanup_naive(&mut self) {
         self.tok_emb.fill(0.0);
         self.pos_emb.fill(0.0);
         for l in &mut self.layers {
@@ -364,6 +370,25 @@ impl MonolithicSLM {
         }
         self.final_norm.fill(0.0);
         self.head.fill(0.0);
+    }
+
+    /// Secure cleanup: volatile zeroization with compiler fences (the same primitive the
+    /// ephemeral engine uses), so the two engines are compared with the same wipe.
+    pub fn cleanup(&mut self) {
+        volatile_zero(&mut self.tok_emb);
+        volatile_zero(&mut self.pos_emb);
+        for l in &mut self.layers {
+            volatile_zero(&mut l.norm1);
+            volatile_zero(&mut l.wq);
+            volatile_zero(&mut l.wk);
+            volatile_zero(&mut l.wv);
+            volatile_zero(&mut l.wo);
+            volatile_zero(&mut l.norm2);
+            volatile_zero(&mut l.w1);
+            volatile_zero(&mut l.w2);
+        }
+        volatile_zero(&mut self.final_norm);
+        volatile_zero(&mut self.head);
     }
 }
 
@@ -451,7 +476,7 @@ impl<'a> EphemeralSLM<'a> {
     pub fn forward_ephemeral(&mut self, tokens: &[u8], telemetry: &TelemetryLogger) -> Vec<f32> {
         let seq_len = tokens.len();
         let d = self.payload.config.d_model;
-        let mut x = vec![0.0_f32; seq_len * d];
+        let mut x = SecureBuffer::<f32>::zeroed(seq_len * d);
 
         // 1. Transient Embedding Lookup:
         // Materialize embeddings only for the active tokens, then scrub buffer.
@@ -488,7 +513,7 @@ impl<'a> EphemeralSLM<'a> {
             let reconstruct_start = Instant::now();
             let slices = self.payload.get_layer_slices(layer_idx);
 
-            let mut norm1 = SecureBuffer::zeroed(slices.norm1.data.len());
+            let mut norm1 = SecureBuffer::zeroed(slices.norm1.len());
             slices.norm1.copy_into(&mut norm1);
 
             let mut wq = SecureBuffer::zeroed(slices.wq.num_elements());
@@ -503,7 +528,7 @@ impl<'a> EphemeralSLM<'a> {
             let mut wo = SecureBuffer::zeroed(slices.wo.num_elements());
             slices.wo.dequantize_into(&mut wo);
 
-            let mut norm2 = SecureBuffer::zeroed(slices.norm2.data.len());
+            let mut norm2 = SecureBuffer::zeroed(slices.norm2.len());
             slices.norm2.copy_into(&mut norm2);
 
             let mut w1 = SecureBuffer::zeroed(slices.w1.num_elements());
@@ -535,7 +560,7 @@ impl<'a> EphemeralSLM<'a> {
             });
 
             // Run attention with pre-norm
-            let mut h_norm = x.clone();
+            let mut h_norm = SecureBuffer::from_vec(x.to_vec());
             for t in 0..seq_len {
                 MathOps::rms_norm(&mut h_norm[t * d..(t + 1) * d], &layer_buf.norm1, 1e-5);
             }
@@ -578,7 +603,7 @@ impl<'a> EphemeralSLM<'a> {
 
         // 3. Transient Head Evaluation:
         let (fn_slice, head_slice) = self.payload.get_final_slices();
-        let mut final_norm = SecureBuffer::zeroed(fn_slice.data.len());
+        let mut final_norm = SecureBuffer::zeroed(fn_slice.len());
         fn_slice.copy_into(&mut final_norm);
 
         let mut head = SecureBuffer::zeroed(head_slice.num_elements());
@@ -589,7 +614,7 @@ impl<'a> EphemeralSLM<'a> {
 
         // Normalize last token
         let last_offset = (seq_len - 1) * d;
-        let mut final_act = x[last_offset..last_offset + d].to_vec();
+        let mut final_act = SecureBuffer::from_vec(x[last_offset..last_offset + d].to_vec());
         MathOps::rms_norm(&mut final_act, &final_norm, 1e-5);
 
         let mut logits = vec![0.0_f32; self.payload.config.vocab_size];

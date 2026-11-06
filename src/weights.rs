@@ -49,17 +49,36 @@ impl<'a> QuantizedSlice<'a> {
     }
 }
 
-/// Raw FP32 weights (used for small 1D normalization vectors where quantization offers minimal gain).
+/// Raw little-endian FP32 weights (used for small 1D normalization vectors where
+/// quantization offers minimal gain).
+///
+/// The bytes are kept as `&[u8]` and decoded with `f32::from_le_bytes`. The payload comes
+/// from `include_bytes!`, which only guarantees 1-byte alignment, so reinterpreting it as
+/// `&[f32]` would be undefined behaviour whenever an offset is not 4-byte aligned.
 #[derive(Debug, Clone, Copy)]
 pub struct Fp32Slice<'a> {
-    pub data: &'a [f32],
+    bytes: &'a [u8],
 }
 
 impl<'a> Fp32Slice<'a> {
+    /// Number of `f32` values in the slice.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bytes.len() / std::mem::size_of::<f32>()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Decode the stored values into `dest`.
     #[inline]
     pub fn copy_into(&self, dest: &mut [f32]) {
-        assert_eq!(dest.len(), self.data.len());
-        dest.copy_from_slice(self.data);
+        assert_eq!(dest.len(), self.len());
+        for (d, chunk) in dest.iter_mut().zip(self.bytes.chunks_exact(4)) {
+            *d = f32::from_le_bytes(chunk.try_into().unwrap());
+        }
     }
 }
 
@@ -167,6 +186,8 @@ impl<'a> PayloadView<'a> {
         *offset += 8;
         let byte_slice = &self.raw[*offset..*offset + length];
         *offset += length;
+        // SAFETY: `i8` and `u8` have identical size and alignment (1), and every bit
+        // pattern is a valid `i8`, so this reinterpretation is sound for any offset.
         let data = unsafe {
             std::slice::from_raw_parts(byte_slice.as_ptr() as *const i8, length)
         };
@@ -176,13 +197,9 @@ impl<'a> PayloadView<'a> {
     fn read_fp32_at(&self, offset: &mut usize, _shape: &'static [usize]) -> Fp32Slice<'a> {
         let byte_len = u32::from_le_bytes(self.raw[*offset..*offset + 4].try_into().unwrap()) as usize;
         *offset += 4;
-        let byte_slice = &self.raw[*offset..*offset + byte_len];
+        let bytes = &self.raw[*offset..*offset + byte_len];
         *offset += byte_len;
-        let float_len = byte_len / std::mem::size_of::<f32>();
-        let data = unsafe {
-            std::slice::from_raw_parts(byte_slice.as_ptr() as *const f32, float_len)
-        };
-        Fp32Slice { data }
+        Fp32Slice { bytes }
     }
 
     pub fn get_embeddings(&self) -> (QuantizedSlice<'a>, QuantizedSlice<'a>) {
