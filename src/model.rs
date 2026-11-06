@@ -3,14 +3,34 @@
 //! Provides two execution engines:
 //! 1. `MonolithicSLM`: Standard architecture where all layer weights are fully
 //!    materialized in heap memory for the duration of the program.
-//! 2. `EphemeralSLM`: Ephemeral streaming architecture where layer weights are
-//!    reconstructed into transient `SecureBuffer`s on demand, executed, and immediately
-//!    scrubbed using volatile writes with compiler memory barriers.
+//! 2. `EphemeralSLM`: Ephemeral streaming architecture where each layer is decrypted from
+//!    the sealed payload, dequantized into transient `SecureBuffer`s, executed, and
+//!    immediately scrubbed using volatile writes with compiler memory barriers.
+//!
+//! Both engines read the model from the sealed (encrypted) payload embedded in the
+//! executable and need the key to do so. The decrypted INT8 plaintext of a section lives in
+//! its own `SecureBuffer` that is wiped as soon as the section has been dequantized.
 
 use crate::ephemeral::{volatile_zero, EphemeralMetrics, SecureBuffer};
+use crate::seal::{SealError, SealedPayload, SecretKey};
 use crate::telemetry::{get_process_rss_bytes, LifecycleEvent, TelemetryLogger};
-use crate::weights::{ModelConfig, PayloadView, EMBEDDED_MODEL_PAYLOAD};
+use crate::weights::{
+    parse_embedding_section, parse_final_section, parse_layer_section, Fp32Slice, ModelConfig,
+    QuantizedSlice, EMBEDDED_SEALED_PAYLOAD,
+};
 use std::time::Instant;
+
+fn dequantized(t: &QuantizedSlice) -> Vec<f32> {
+    let mut v = vec![0.0_f32; t.num_elements()];
+    t.dequantize_into(&mut v);
+    v
+}
+
+fn decoded(t: &Fp32Slice) -> Vec<f32> {
+    let mut v = vec![0.0_f32; t.len()];
+    t.copy_into(&mut v);
+    v
+}
 
 /// Mathematical primitives for micro-transformer inference.
 pub struct MathOps;
@@ -207,81 +227,80 @@ pub struct MonolithicSLM {
     pub final_norm: Vec<f32>,
     pub head: Vec<f32>,
     pub total_param_bytes: usize,
-}
-
-impl Default for MonolithicSLM {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Decrypted INT8 plaintext that was wiped during construction.
+    pub plaintext_bytes_wiped: usize,
 }
 
 impl MonolithicSLM {
-    pub fn new() -> Self {
-        let payload = PayloadView::parse(EMBEDDED_MODEL_PAYLOAD).expect("Valid embedded payload");
-        let cfg = payload.config;
+    /// Build the baseline from the sealed payload embedded in the executable.
+    pub fn open(key: &SecretKey) -> Result<Self, SealError> {
+        Self::from_sealed(EMBEDDED_SEALED_PAYLOAD, key)
+    }
 
-        let (tok_slice, pos_slice) = payload.get_embeddings();
-        let mut tok_emb = vec![0.0_f32; tok_slice.num_elements()];
-        tok_slice.dequantize_into(&mut tok_emb);
+    /// Decrypt every section once and keep all dequantized weights resident (the baseline).
+    ///
+    /// Each section is decrypted into its own `SecureBuffer` that is volatile-wiped as soon
+    /// as it has been dequantized, so the INT8 plaintext does not outlive this call.
+    pub fn from_sealed(raw: &[u8], key: &SecretKey) -> Result<Self, SealError> {
+        let sealed = SealedPayload::parse(raw)?;
+        let cfg = sealed.config;
+        let mut plaintext_bytes_wiped = 0;
 
-        let mut pos_emb = vec![0.0_f32; pos_slice.num_elements()];
-        pos_slice.dequantize_into(&mut pos_emb);
+        let open = |i: usize| -> Result<SecureBuffer<u8>, SealError> {
+            let mut plain = SecureBuffer::<u8>::zeroed(sealed.section_plain_len(i));
+            sealed.open_section(i, key, &mut plain)?;
+            Ok(plain)
+        };
 
-        let mut layers = Vec::with_capacity(cfg.n_layers);
+        let mut plain = open(0)?;
+        let (tok_emb, pos_emb) = {
+            let (tok, pos) = parse_embedding_section(&plain);
+            (dequantized(&tok), dequantized(&pos))
+        };
+        plaintext_bytes_wiped += plain.size_bytes();
+        plain.scrub();
         let mut total_param_bytes = (tok_emb.len() + pos_emb.len()) * 4;
 
+        let mut layers = Vec::with_capacity(cfg.n_layers);
         for l in 0..cfg.n_layers {
-            let ls = payload.get_layer_slices(l);
-
-            let mut norm1 = vec![0.0_f32; ls.norm1.len()];
-            ls.norm1.copy_into(&mut norm1);
-
-            let mut wq = vec![0.0_f32; ls.wq.num_elements()];
-            ls.wq.dequantize_into(&mut wq);
-
-            let mut wk = vec![0.0_f32; ls.wk.num_elements()];
-            ls.wk.dequantize_into(&mut wk);
-
-            let mut wv = vec![0.0_f32; ls.wv.num_elements()];
-            ls.wv.dequantize_into(&mut wv);
-
-            let mut wo = vec![0.0_f32; ls.wo.num_elements()];
-            ls.wo.dequantize_into(&mut wo);
-
-            let mut norm2 = vec![0.0_f32; ls.norm2.len()];
-            ls.norm2.copy_into(&mut norm2);
-
-            let mut w1 = vec![0.0_f32; ls.w1.num_elements()];
-            ls.w1.dequantize_into(&mut w1);
-
-            let mut w2 = vec![0.0_f32; ls.w2.num_elements()];
-            ls.w2.dequantize_into(&mut w2);
-
-            total_param_bytes += (norm1.len() + wq.len() + wk.len() + wv.len() + wo.len()
-                + norm2.len() + w1.len() + w2.len()) * 4;
-
-            layers.push(MonolithicLayer {
-                norm1,
-                wq,
-                wk,
-                wv,
-                wo,
-                norm2,
-                w1,
-                w2,
-            });
+            let mut plain = open(1 + l)?;
+            let layer = {
+                let ls = parse_layer_section(&plain);
+                MonolithicLayer {
+                    norm1: decoded(&ls.norm1),
+                    wq: dequantized(&ls.wq),
+                    wk: dequantized(&ls.wk),
+                    wv: dequantized(&ls.wv),
+                    wo: dequantized(&ls.wo),
+                    norm2: decoded(&ls.norm2),
+                    w1: dequantized(&ls.w1),
+                    w2: dequantized(&ls.w2),
+                }
+            };
+            plaintext_bytes_wiped += plain.size_bytes();
+            plain.scrub();
+            total_param_bytes += (layer.norm1.len()
+                + layer.wq.len()
+                + layer.wk.len()
+                + layer.wv.len()
+                + layer.wo.len()
+                + layer.norm2.len()
+                + layer.w1.len()
+                + layer.w2.len())
+                * 4;
+            layers.push(layer);
         }
 
-        let (fn_slice, head_slice) = payload.get_final_slices();
-        let mut final_norm = vec![0.0_f32; fn_slice.len()];
-        fn_slice.copy_into(&mut final_norm);
-
-        let mut head = vec![0.0_f32; head_slice.num_elements()];
-        head_slice.dequantize_into(&mut head);
-
+        let mut plain = open(cfg.n_layers + 1)?;
+        let (final_norm, head) = {
+            let (norm, head) = parse_final_section(&plain);
+            (decoded(&norm), dequantized(&head))
+        };
+        plaintext_bytes_wiped += plain.size_bytes();
+        plain.scrub();
         total_param_bytes += (final_norm.len() + head.len()) * 4;
 
-        Self {
+        Ok(Self {
             config: cfg,
             tok_emb,
             pos_emb,
@@ -289,7 +308,8 @@ impl MonolithicSLM {
             final_norm,
             head,
             total_param_bytes,
-        }
+            plaintext_bytes_wiped,
+        })
     }
 
     /// Compute forward pass and return logits for the final token in the prompt.
@@ -443,45 +463,75 @@ impl TransientLayerBuffer {
     }
 }
 
+
 pub struct EphemeralSLM<'a> {
-    payload: PayloadView<'a>,
+    sealed: SealedPayload<'a>,
+    key: &'a SecretKey,
     pub metrics: EphemeralMetrics,
 }
 
-impl<'a> Default for EphemeralSLM<'a> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<'a> EphemeralSLM<'a> {
-    pub fn new() -> Self {
-        let payload = PayloadView::parse(EMBEDDED_MODEL_PAYLOAD).expect("Valid embedded payload");
-        Self {
-            payload,
+    /// Use the sealed payload embedded in the executable.
+    pub fn open(key: &'a SecretKey) -> Result<Self, SealError> {
+        Self::from_sealed(EMBEDDED_SEALED_PAYLOAD, key)
+    }
+
+    /// Use any sealed payload. Every section's authentication tag is checked up front
+    /// (no plaintext is produced), so a wrong key or a damaged file is rejected here,
+    /// before any work is done. Each section is checked again when it is decrypted.
+    pub fn from_sealed(raw: &'a [u8], key: &'a SecretKey) -> Result<Self, SealError> {
+        let sealed = SealedPayload::parse(raw)?;
+        sealed.verify_all(key)?;
+        Ok(Self {
+            sealed,
+            key,
             metrics: EphemeralMetrics::default(),
-        }
+        })
     }
 
     pub fn config(&self) -> ModelConfig {
-        self.payload.config
+        self.sealed.config
     }
 
+    /// Size of the sealed payload embedded in the executable.
     pub fn payload_bytes(&self) -> usize {
-        self.payload.total_payload_bytes()
+        self.sealed.total_bytes()
     }
 
-    /// Forward pass through the network where parameters are reconstructed layer-by-layer,
-    /// executed, and immediately zeroized with volatile memory barriers.
-    pub fn forward_ephemeral(&mut self, tokens: &[u8], telemetry: &TelemetryLogger) -> Vec<f32> {
+    /// Decrypt section `i` into a fresh transient buffer. Nothing is written if the tag
+    /// does not verify.
+    fn open_section(&self, i: usize) -> Result<SecureBuffer<u8>, SealError> {
+        let mut plain = SecureBuffer::<u8>::zeroed(self.sealed.section_plain_len(i));
+        self.sealed.open_section(i, self.key, &mut plain)?;
+        Ok(plain)
+    }
+
+    /// Wipe a decrypted section, read it back, and record the result.
+    fn wipe_plaintext(metrics: &mut EphemeralMetrics, mut plain: SecureBuffer<u8>) {
+        let bytes = plain.size_bytes();
+        plain.scrub();
+        let clean = plain.audit_is_zero();
+        metrics.record_plaintext_wipe(bytes, clean);
+    }
+
+    /// Forward pass where each section is decrypted, dequantized, executed, and wiped in
+    /// turn. The decrypted INT8 plaintext is wiped as soon as it has been dequantized (before
+    /// the layer runs); the dequantized f32 weights are wiped right after the layer runs.
+    pub fn forward_ephemeral(
+        &mut self,
+        tokens: &[u8],
+        telemetry: &TelemetryLogger,
+    ) -> Result<Vec<f32>, SealError> {
         let seq_len = tokens.len();
-        let d = self.payload.config.d_model;
+        let cfg = self.sealed.config;
+        let d = cfg.d_model;
         let mut x = SecureBuffer::<f32>::zeroed(seq_len * d);
 
         // 1. Transient Embedding Lookup:
         // Materialize embeddings only for the active tokens, then scrub buffer.
         {
-            let (tok_slice, pos_slice) = self.payload.get_embeddings();
+            let plain = self.open_section(0)?;
+            let (tok_slice, pos_slice) = parse_embedding_section(&plain);
             let mut transient_tok = SecureBuffer::zeroed(tok_slice.num_elements());
             let mut transient_pos = SecureBuffer::zeroed(pos_slice.num_elements());
             let emb_bytes = transient_tok.size_bytes() + transient_pos.size_bytes();
@@ -489,6 +539,7 @@ impl<'a> EphemeralSLM<'a> {
 
             tok_slice.dequantize_into(&mut transient_tok);
             pos_slice.dequantize_into(&mut transient_pos);
+            Self::wipe_plaintext(&mut self.metrics, plain);
 
             for t in 0..seq_len {
                 let tok_idx = tokens[t] as usize;
@@ -508,10 +559,11 @@ impl<'a> EphemeralSLM<'a> {
         }
 
         // 2. Transient Layer Streaming:
-        // Each layer block is reconstituted in RAM, evaluated, and immediately scrubbed.
-        for layer_idx in 0..self.payload.config.n_layers {
+        // Each layer is decrypted, dequantized, evaluated, and immediately scrubbed.
+        for layer_idx in 0..cfg.n_layers {
             let reconstruct_start = Instant::now();
-            let slices = self.payload.get_layer_slices(layer_idx);
+            let plain = self.open_section(1 + layer_idx)?;
+            let slices = parse_layer_section(&plain);
 
             let mut norm1 = SecureBuffer::zeroed(slices.norm1.len());
             slices.norm1.copy_into(&mut norm1);
@@ -536,6 +588,9 @@ impl<'a> EphemeralSLM<'a> {
 
             let mut w2 = SecureBuffer::zeroed(slices.w2.num_elements());
             slices.w2.dequantize_into(&mut w2);
+
+            // The INT8 plaintext is no longer needed: wipe it before computing.
+            Self::wipe_plaintext(&mut self.metrics, plain);
 
             let mut layer_buf = TransientLayerBuffer {
                 norm1,
@@ -568,7 +623,7 @@ impl<'a> EphemeralSLM<'a> {
                 &mut h_norm,
                 seq_len,
                 d,
-                self.payload.config.n_heads,
+                cfg.n_heads,
                 &layer_buf.wq,
                 &layer_buf.wk,
                 &layer_buf.wv,
@@ -581,7 +636,7 @@ impl<'a> EphemeralSLM<'a> {
                 &mut x,
                 seq_len,
                 d,
-                self.payload.config.d_ff,
+                cfg.d_ff,
                 &layer_buf.norm2,
                 &layer_buf.w1,
                 &layer_buf.w2,
@@ -602,12 +657,14 @@ impl<'a> EphemeralSLM<'a> {
         }
 
         // 3. Transient Head Evaluation:
-        let (fn_slice, head_slice) = self.payload.get_final_slices();
+        let plain = self.open_section(cfg.n_layers + 1)?;
+        let (fn_slice, head_slice) = parse_final_section(&plain);
         let mut final_norm = SecureBuffer::zeroed(fn_slice.len());
         fn_slice.copy_into(&mut final_norm);
 
         let mut head = SecureBuffer::zeroed(head_slice.num_elements());
         head_slice.dequantize_into(&mut head);
+        Self::wipe_plaintext(&mut self.metrics, plain);
 
         let head_bytes = final_norm.size_bytes() + head.size_bytes();
         self.metrics.record_allocation(head_bytes);
@@ -617,8 +674,8 @@ impl<'a> EphemeralSLM<'a> {
         let mut final_act = SecureBuffer::from_vec(x[last_offset..last_offset + d].to_vec());
         MathOps::rms_norm(&mut final_act, &final_norm, 1e-5);
 
-        let mut logits = vec![0.0_f32; self.payload.config.vocab_size];
-        MathOps::matvec(&head, &final_act, &mut logits, d, self.payload.config.vocab_size);
+        let mut logits = vec![0.0_f32; cfg.vocab_size];
+        MathOps::matvec(&head, &final_act, &mut logits, d, cfg.vocab_size);
 
         // Scrub head buffers
         final_norm.scrub();
@@ -627,6 +684,6 @@ impl<'a> EphemeralSLM<'a> {
         self.metrics.record_scrub(head_bytes);
         self.metrics.record_audit(passed);
 
-        logits
+        Ok(logits)
     }
 }

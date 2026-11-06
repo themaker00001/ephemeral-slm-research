@@ -1,9 +1,11 @@
-use ephemeral_slm_research::{
-    get_process_rss_bytes,
-    EphemeralSLM, LifecycleEvent, MonolithicSLM, TelemetryLogger,
-};
 use ephemeral_slm_research::forensics;
+use ephemeral_slm_research::seal::{self, SealedPayload, SecretKey};
+use ephemeral_slm_research::{
+    get_process_rss_bytes, EphemeralSLM, LifecycleEvent, MonolithicSLM, SecureBuffer, TelemetryLogger,
+    EMBEDDED_SEALED_PAYLOAD,
+};
 use std::env;
+use std::fmt::Display;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
@@ -15,57 +17,83 @@ struct CliArgs {
     reps: usize,
     verify: bool,
     forensics: bool,
-    forensics_child: Option<(String, String)>,
+    forensics_child: Option<(String, String, String)>,
     verbose: bool,
+    key_file: Option<String>,
+    seal: Option<(String, String)>,
+    force: bool,
+    gen_key: Option<String>,
 }
 
 fn parse_args() -> CliArgs {
     let args: Vec<String> = env::args().collect();
-    let mut prompt = "The ephemeral ".to_string();
-    let mut tokens = 35;
-    let mut mode = "ephemeral".to_string();
-    let mut benchmark = false;
-    let mut reps = 15;
-    let mut verify = false;
-    let mut forensics = false;
-    let mut forensics_child = None;
-    let mut verbose = false;
+    let mut cli = CliArgs {
+        prompt: "The ephemeral ".to_string(),
+        tokens: 35,
+        mode: "ephemeral".to_string(),
+        benchmark: false,
+        reps: 15,
+        verify: false,
+        forensics: false,
+        forensics_child: None,
+        verbose: false,
+        key_file: None,
+        seal: None,
+        force: false,
+        gen_key: None,
+    };
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--prompt" | "-p" if i + 1 < args.len() => {
-                prompt = args[i + 1].clone();
+                cli.prompt = args[i + 1].clone();
                 i += 1;
             }
             "--tokens" | "-n" if i + 1 < args.len() => {
-                tokens = args[i + 1].parse().unwrap_or(35);
+                cli.tokens = args[i + 1].parse().unwrap_or(35);
                 i += 1;
             }
             "--mode" | "-m" if i + 1 < args.len() => {
-                mode = args[i + 1].to_lowercase();
+                cli.mode = args[i + 1].to_lowercase();
                 i += 1;
             }
             "--reps" if i + 1 < args.len() => {
-                reps = args[i + 1].parse().unwrap_or(15).max(1);
+                cli.reps = args[i + 1].parse().unwrap_or(15).max(1);
                 i += 1;
             }
-            "--benchmark" | "-b" => {
-                benchmark = true;
+            "--key-file" | "-k" if i + 1 < args.len() => {
+                cli.key_file = Some(args[i + 1].clone());
+                i += 1;
             }
-            "--verify" => {
-                verify = true;
-            }
-            "--forensics" => {
-                forensics = true;
-            }
-            // Internal: used by `--forensics` to run one scenario in a fresh process.
-            "--forensics-child" if i + 2 < args.len() => {
-                forensics_child = Some((args[i + 1].clone(), args[i + 2].clone()));
+            "--seal" if i + 2 < args.len() => {
+                cli.seal = Some((args[i + 1].clone(), args[i + 2].clone()));
                 i += 2;
             }
+            "--gen-key" if i + 1 < args.len() => {
+                cli.gen_key = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--force" => {
+                cli.force = true;
+            }
+            "--benchmark" | "-b" => {
+                cli.benchmark = true;
+            }
+            "--verify" => {
+                cli.verify = true;
+            }
+            "--forensics" => {
+                cli.forensics = true;
+            }
+            // Internal: used by `--forensics` to run one scenario in a fresh process.
+            "--forensics-child" if i + 3 < args.len() => {
+                cli.forensics_child =
+                    Some((args[i + 1].clone(), args[i + 2].clone(), args[i + 3].clone()));
+                i += 3;
+            }
             "--verbose" | "-v" => {
-                verbose = true;
+                cli.verbose = true;
             }
             "--help" | "-h" => {
                 print_help();
@@ -75,25 +103,18 @@ fn parse_args() -> CliArgs {
         }
         i += 1;
     }
-
-    CliArgs {
-        prompt,
-        tokens,
-        mode,
-        benchmark,
-        reps,
-        verify,
-        forensics,
-        forensics_child,
-        verbose,
-    }
+    cli
 }
 
 fn print_help() {
-    println!("Ephemeral SLM Research Demo (Concrete Implementation)");
+    println!("Ephemeral SLM Research (sealed model, layer-by-layer decryption)");
     println!();
     println!("USAGE:");
-    println!("    cargo run -- [OPTIONS]");
+    println!("    cargo run --release -- --key-file assets/demo.key [OPTIONS]");
+    println!();
+    println!("The model is embedded encrypted. Every mode that runs it needs the key:");
+    println!("    -k, --key-file <PATH>  File holding the key as 64 hex characters");
+    println!("                           (or set ESLM_KEY; the demo key is assets/demo.key)");
     println!();
     println!("OPTIONS:");
     println!("    -p, --prompt <TEXT>    Initial text prompt (default: 'The ephemeral ')");
@@ -101,15 +122,30 @@ fn print_help() {
     println!("    -m, --mode <MODE>      Execution mode: 'ephemeral' (default) or 'monolithic'");
     println!("    -b, --benchmark        Run side-by-side benchmark comparing monolithic vs ephemeral");
     println!("        --reps <NUM>       Benchmark repetitions after warm-up (default: 15)");
-    println!("        --verify           Check that SecureBuffer scrubbing zeroes a buffer");
     println!("        --forensics        Scan process memory for residual weights (macOS only)");
+    println!("        --verify           Check that SecureBuffer scrubbing zeroes a buffer (no key needed)");
     println!("    -v, --verbose          Print micro-level per-layer lifecycle telemetry");
+    println!();
+    println!("KEY AND SEALING TOOLS (no model is run):");
+    println!("        --gen-key <PATH>   Write a new random key (refuses to overwrite)");
+    println!("        --seal <IN> <OUT>  Encrypt a plaintext weights.bin into a sealed file");
+    println!("                           (add --force to overwrite OUT). Rebuild afterwards.");
+    println!();
     println!("    -h, --help             Print help information");
 }
 
-fn run_ephemeral_generation(prompt: &str, num_tokens: usize, verbose: bool) {
+fn fail(msg: impl Display) -> ! {
+    eprintln!("error: {msg}");
+    std::process::exit(2);
+}
+
+fn load_key(path: Option<&str>) -> SecretKey {
+    SecretKey::from_cli(path).unwrap_or_else(|e| fail(e))
+}
+
+fn run_ephemeral_generation(prompt: &str, num_tokens: usize, verbose: bool, key: &SecretKey) {
     let telemetry = TelemetryLogger::new(verbose);
-    let mut model = EphemeralSLM::new();
+    let mut model = EphemeralSLM::open(key).unwrap_or_else(|e| fail(e));
     let cfg = model.config();
     let init_rss = get_process_rss_bytes() / 1024;
 
@@ -123,18 +159,15 @@ fn run_ephemeral_generation(prompt: &str, num_tokens: usize, verbose: bool) {
     println!("--------------------------------------------------");
     println!(" Mode:       EPHEMERAL (Transient Streaming)");
     println!(" Model:      2-Layer LLaMA-style MicroTransformer");
-    println!(" Parameters: 50,928 weights (INT8 compressed)");
-    println!(" Embedded:   {} bytes (.rodata)", model.payload_bytes());
+    println!(" Parameters: 50,928 weights (INT8, encrypted at rest)");
+    println!(" Embedded:   {} bytes sealed (.rodata, ChaCha20-Poly1305)", model.payload_bytes());
     println!(" RSS Init:   {} KB", init_rss);
     println!("--------------------------------------------------");
     println!("Generating text from prompt: \"{}\"", prompt);
     print!("{}", prompt);
     io::stdout().flush().unwrap();
 
-    let mut token_ids: Vec<u8> = prompt.bytes().filter(|&b| b < 128).collect();
-    if token_ids.is_empty() {
-        token_ids.push(b' ');
-    }
+    let mut token_ids = prompt_ids(prompt);
 
     let gen_start = Instant::now();
 
@@ -143,19 +176,11 @@ fn run_ephemeral_generation(prompt: &str, num_tokens: usize, verbose: bool) {
         let ctx_start = token_ids.len().saturating_sub(cfg.ctx_len);
         let ctx = &token_ids[ctx_start..];
 
-        let logits = model.forward_ephemeral(ctx, &telemetry);
+        let logits = model
+            .forward_ephemeral(ctx, &telemetry)
+            .unwrap_or_else(|e| fail(e));
 
-        // Greedy argmax selection
-        let mut best_idx = 0;
-        let mut max_logit = f32::NEG_INFINITY;
-        for (idx, &val) in logits.iter().enumerate() {
-            if val > max_logit {
-                max_logit = val;
-                best_idx = idx;
-            }
-        }
-
-        let next_token = best_idx as u8;
+        let next_token = argmax(&logits);
         token_ids.push(next_token);
 
         let ch = next_token as char;
@@ -187,15 +212,16 @@ fn run_ephemeral_generation(prompt: &str, num_tokens: usize, verbose: bool) {
     println!(" - Total time:            {:.2} ms ({:.2} ms/token)", total_us as f64 / 1000.0, total_us as f64 / 1000.0 / num_tokens as f64);
     println!(" - Peak parameter in RAM: {} KB (only 1 layer at any instant!)", model.metrics.peak_active_bytes / 1024);
     println!(" - Active params now:     {} KB (ephemeral eradication)", model.metrics.current_active_bytes / 1024);
+    println!(" - Sections decrypted:    {} ({} KB of INT8 plaintext, each wiped right after use)", model.metrics.sections_opened, model.metrics.plaintext_bytes_wiped / 1024);
     println!(" - Total bytes scrubbed:  {} bytes across {} operations", model.metrics.total_bytes_scrubbed, model.metrics.scrub_operations);
     println!(" - Forensic zero-audits:  {} passed, {} failed", model.metrics.audits_passed, model.metrics.audits_failed);
     println!(" - Final process RSS:     {} KB", final_rss);
 }
 
-fn run_monolithic_generation(prompt: &str, num_tokens: usize, verbose: bool) {
+fn run_monolithic_generation(prompt: &str, num_tokens: usize, verbose: bool, key: &SecretKey) {
     let telemetry = TelemetryLogger::new(verbose);
     let init_rss = get_process_rss_bytes() / 1024;
-    let mut model = MonolithicSLM::new();
+    let mut model = MonolithicSLM::open(key).unwrap_or_else(|e| fail(e));
     let post_alloc_rss = get_process_rss_bytes() / 1024;
 
     telemetry.log(LifecycleEvent::ModelInitialized {
@@ -216,10 +242,7 @@ fn run_monolithic_generation(prompt: &str, num_tokens: usize, verbose: bool) {
     print!("{}", prompt);
     io::stdout().flush().unwrap();
 
-    let mut token_ids: Vec<u8> = prompt.bytes().filter(|&b| b < 128).collect();
-    if token_ids.is_empty() {
-        token_ids.push(b' ');
-    }
+    let mut token_ids = prompt_ids(prompt);
 
     let gen_start = Instant::now();
 
@@ -230,16 +253,7 @@ fn run_monolithic_generation(prompt: &str, num_tokens: usize, verbose: bool) {
 
         let logits = model.forward(ctx);
 
-        let mut best_idx = 0;
-        let mut max_logit = f32::NEG_INFINITY;
-        for (idx, &val) in logits.iter().enumerate() {
-            if val > max_logit {
-                max_logit = val;
-                best_idx = idx;
-            }
-        }
-
-        let next_token = best_idx as u8;
+        let next_token = argmax(&logits);
         token_ids.push(next_token);
 
         let ch = next_token as char;
@@ -271,6 +285,7 @@ fn run_monolithic_generation(prompt: &str, num_tokens: usize, verbose: bool) {
     println!(" - Tokens generated:      {}", num_tokens);
     println!(" - Total time:            {:.2} ms ({:.2} ms/token)", total_us as f64 / 1000.0, total_us as f64 / 1000.0 / num_tokens as f64);
     println!(" - Retained in RAM:       {} KB (throughout execution)", model.total_param_bytes / 1024);
+    println!(" - INT8 plaintext wiped:  {} KB (at load, after dequantization)", model.plaintext_bytes_wiped / 1024);
     println!(" - Final process RSS:     {} KB", final_rss);
 }
 
@@ -298,6 +313,7 @@ struct MonoRun {
     wipe: Duration,
     out: Vec<u8>,
     resident_bytes: usize,
+    plaintext_wiped: usize,
 }
 
 struct EphemRun {
@@ -307,9 +323,10 @@ struct EphemRun {
     metrics: ephemeral_slm_research::EphemeralMetrics,
 }
 
-fn bench_monolithic(prompt: &str, num_tokens: usize) -> MonoRun {
+fn bench_monolithic(prompt: &str, num_tokens: usize, key: &SecretKey) -> MonoRun {
+    // Construction includes decrypting every section once.
     let t = Instant::now();
-    let mut model = MonolithicSLM::new();
+    let mut model = MonolithicSLM::open(key).unwrap_or_else(|e| fail(e));
     let init = t.elapsed();
 
     let mut ids = prompt_ids(prompt);
@@ -322,17 +339,18 @@ fn bench_monolithic(prompt: &str, num_tokens: usize) -> MonoRun {
     let gen = t.elapsed();
 
     let resident_bytes = model.total_param_bytes;
+    let plaintext_wiped = model.plaintext_bytes_wiped;
     // Same volatile wipe the ephemeral engine uses, so only the residency differs.
     let t = Instant::now();
     model.cleanup();
     let wipe = t.elapsed();
-    MonoRun { init, gen, wipe, out: ids, resident_bytes }
+    MonoRun { init, gen, wipe, out: ids, resident_bytes, plaintext_wiped }
 }
 
-fn bench_ephemeral(prompt: &str, num_tokens: usize) -> EphemRun {
+fn bench_ephemeral(prompt: &str, num_tokens: usize, key: &SecretKey) -> EphemRun {
     let telemetry = TelemetryLogger::new(false);
     let t = Instant::now();
-    let mut model = EphemeralSLM::new();
+    let mut model = EphemeralSLM::open(key).unwrap_or_else(|e| fail(e));
     let init = t.elapsed();
 
     let mut ids = prompt_ids(prompt);
@@ -340,11 +358,31 @@ fn bench_ephemeral(prompt: &str, num_tokens: usize) -> EphemRun {
     let t = Instant::now();
     for _ in 0..num_tokens {
         let start = ids.len().saturating_sub(ctx_len);
-        let logits = model.forward_ephemeral(&ids[start..], &telemetry);
+        let logits = model
+            .forward_ephemeral(&ids[start..], &telemetry)
+            .unwrap_or_else(|e| fail(e));
         ids.push(argmax(&logits));
     }
     let gen = t.elapsed();
     EphemRun { init, gen, out: ids, metrics: model.metrics.clone() }
+}
+
+/// Time to authenticate and decrypt every section once (what the ephemeral engine repeats
+/// on every token), measured in isolation.
+fn bench_decrypt_all(key: &SecretKey) -> Duration {
+    let sealed = SealedPayload::parse(EMBEDDED_SEALED_PAYLOAD).unwrap_or_else(|e| fail(e));
+    let mut bufs: Vec<SecureBuffer<u8>> = (0..sealed.section_count())
+        .map(|i| SecureBuffer::zeroed(sealed.section_plain_len(i)))
+        .collect();
+    let t = Instant::now();
+    for (i, b) in bufs.iter_mut().enumerate() {
+        sealed.open_section(i, key, b).unwrap_or_else(|e| fail(e));
+    }
+    let d = t.elapsed();
+    for b in bufs.iter_mut() {
+        b.scrub();
+    }
+    d
 }
 
 fn median(v: &mut [Duration]) -> Duration {
@@ -352,7 +390,7 @@ fn median(v: &mut [Duration]) -> Duration {
     v[v.len() / 2]
 }
 
-fn run_side_by_side_benchmark(prompt: &str, num_tokens: usize, reps: usize) {
+fn run_side_by_side_benchmark(prompt: &str, num_tokens: usize, reps: usize, key: &SecretKey) {
     const WARMUP: usize = 3;
     let num_tokens = num_tokens.max(1);
 
@@ -361,11 +399,13 @@ fn run_side_by_side_benchmark(prompt: &str, num_tokens: usize, reps: usize) {
     println!("==================================================================");
     println!("Prompt: \"{}\"   Tokens: {}   Warm-up: {}   Timed runs: {}", prompt, num_tokens, WARMUP, reps);
     println!("Order alternates every run; both engines use the same volatile wipe.");
+    println!("Both decrypt from the sealed payload: monolithic once, ephemeral per token.");
     println!();
 
     for _ in 0..WARMUP {
-        let _ = bench_monolithic(prompt, num_tokens);
-        let _ = bench_ephemeral(prompt, num_tokens);
+        let _ = bench_monolithic(prompt, num_tokens, key);
+        let _ = bench_ephemeral(prompt, num_tokens, key);
+        let _ = bench_decrypt_all(key);
     }
 
     let mut m_init = Vec::new();
@@ -373,20 +413,22 @@ fn run_side_by_side_benchmark(prompt: &str, num_tokens: usize, reps: usize) {
     let mut m_wipe = Vec::new();
     let mut e_init = Vec::new();
     let mut e_gen = Vec::new();
+    let mut dec = Vec::new();
     let mut parity = true;
     let mut last_m: Option<MonoRun> = None;
     let mut last_e: Option<EphemRun> = None;
 
     for rep in 0..reps {
         let (m, e) = if rep % 2 == 0 {
-            let m = bench_monolithic(prompt, num_tokens);
-            let e = bench_ephemeral(prompt, num_tokens);
+            let m = bench_monolithic(prompt, num_tokens, key);
+            let e = bench_ephemeral(prompt, num_tokens, key);
             (m, e)
         } else {
-            let e = bench_ephemeral(prompt, num_tokens);
-            let m = bench_monolithic(prompt, num_tokens);
+            let e = bench_ephemeral(prompt, num_tokens, key);
+            let m = bench_monolithic(prompt, num_tokens, key);
             (m, e)
         };
+        dec.push(bench_decrypt_all(key));
         parity &= m.out == e.out;
         m_init.push(m.init);
         m_gen.push(m.gen);
@@ -406,8 +448,12 @@ fn run_side_by_side_benchmark(prompt: &str, num_tokens: usize, reps: usize) {
     let m_wipe_med = median(&mut m_wipe);
     let e_init_med = median(&mut e_init);
     let e_gen_med = median(&mut e_gen);
+    let dec_med = median(&mut dec);
     let kb = |b: usize| format!("{:.1} KB", b as f64 / 1024.0);
-    let payload_kb = kb(ephemeral_slm_research::EMBEDDED_MODEL_PAYLOAD.len());
+    let payload_kb = kb(EMBEDDED_SEALED_PAYLOAD.len());
+    let max_section = SealedPayload::parse(EMBEDDED_SEALED_PAYLOAD)
+        .map(|s| s.max_section_len())
+        .unwrap_or(0);
     let n = num_tokens as u32;
 
     println!("=========================== RESULTS ================================");
@@ -415,10 +461,12 @@ fn run_side_by_side_benchmark(prompt: &str, num_tokens: usize, reps: usize) {
     println!("------------------------------------+--------------------+-----------------");
     println!("Decompressed weights, peak resident | {:>18} | {:>15}", kb(m.resident_bytes), kb(e.metrics.peak_active_bytes));
     println!("Decompressed weights after run      | {:>18} | {:>15}", format!("{} (zeroed)", kb(m.resident_bytes)), kb(e.metrics.current_active_bytes));
-    println!("INT8 payload in .rodata (always)    | {:>18} | {:>15}", payload_kb, payload_kb);
-    println!("Bytes volatile-wiped per run        | {:>18} | {:>15}", m.resident_bytes, e.metrics.total_bytes_scrubbed);
+    println!("Sealed payload in .rodata (always)  | {:>18} | {:>15}", payload_kb, payload_kb);
+    println!("Decrypted INT8, most held at once   | {:>18} | {:>15}", kb(max_section), kb(e.metrics.peak_plaintext_bytes));
+    println!("Decrypted INT8 wiped per run        | {:>18} | {:>15}", m.plaintext_wiped, e.metrics.plaintext_bytes_wiped);
+    println!("Decompressed bytes wiped per run    | {:>18} | {:>15}", m.resident_bytes, e.metrics.total_bytes_scrubbed);
     println!("Zero-audits passed / failed         | {:>18} | {:>15}", "n/a", format!("{} / {}", e.metrics.audits_passed, e.metrics.audits_failed));
-    println!("Upfront cost (median)               | {:>18.2?} | {:>15.2?}", m_init_med, e_init_med);
+    println!("Upfront cost incl. decrypt (median) | {:>18.2?} | {:>15.2?}", m_init_med, e_init_med);
     println!("Wipe cost, explicit (median)        | {:>18.2?} | {:>15}", m_wipe_med, "in generation");
     println!("Generation (median)                 | {:>18.2?} | {:>15.2?}", m_gen_med, e_gen_med);
     println!("Generation (min .. max)             | {:>18} | {:>15}", format!("{:.1?}..{:.1?}", m_gen_min, m_gen_max), format!("{:.1?}..{:.1?}", e_gen_min, e_gen_max));
@@ -427,22 +475,58 @@ fn run_side_by_side_benchmark(prompt: &str, num_tokens: usize, reps: usize) {
     println!("Output parity (all runs)            | {}", if parity { "IDENTICAL" } else { "MISMATCH" });
     println!("====================================================================");
     println!("Notes:");
-    println!(" - The INT8 payload stays resident in both engines; only the decompressed");
-    println!("   f32 working copies differ. This is not model confidentiality.");
+    println!(" - One full decrypt + authenticate of every section takes {:.1?} (median).", dec_med);
+    println!("   Monolithic pays that once; ephemeral pays it on every token ({} here).", num_tokens);
+    println!(" - The executable holds only ciphertext. The key is not embedded, but it stays");
+    println!("   in process memory for the whole run in both engines.");
     println!(" - If the min..max ranges overlap, the latency difference is not significant.");
     println!(" - Run with --release; debug builds are not representative.");
     println!("Generated text:\n\"{}\"", String::from_utf8_lossy(&e.out));
 }
 
+fn run_gen_key(path: &str) {
+    let key = SecretKey::random().unwrap_or_else(|e| fail(e));
+    key.write_to_file(path).unwrap_or_else(|e| fail(e));
+    println!("[ok] wrote a new 256-bit key to {path} (64 hex characters).");
+    println!("     Keep it out of version control and out of the executable.");
+}
+
+fn run_seal(input: &str, output: &str, force: bool, key: &SecretKey) {
+    if !force && std::path::Path::new(output).exists() {
+        fail(format!("{output} already exists (use --force to overwrite)"));
+    }
+    let plain = std::fs::read(input).unwrap_or_else(|e| fail(format!("{input}: {e}")));
+    let sealed = seal::seal_random_nonce(&plain, key).unwrap_or_else(|e| fail(e));
+    // Read it back before writing anything: the sealed bytes must open to the same payload.
+    let back = SealedPayload::parse(&sealed)
+        .and_then(|s| s.open_all(key))
+        .unwrap_or_else(|e| fail(format!("self-check failed: {e}")));
+    if back != plain {
+        fail("self-check failed: the sealed payload does not open to the input");
+    }
+    std::fs::write(output, &sealed).unwrap_or_else(|e| fail(format!("{output}: {e}")));
+    println!(
+        "[ok] sealed {} plaintext bytes into {} bytes at {output} (self-check passed).",
+        plain.len(),
+        sealed.len()
+    );
+    println!("     Rebuild so the new file is embedded: cargo build --release");
+}
+
 fn main() {
     let args = parse_args();
 
-    if let Some((scenario, sig_hex)) = &args.forensics_child {
-        std::process::exit(forensics::run_child(scenario, sig_hex));
+    if let Some((scenario, sig_hex, n_f32)) = &args.forensics_child {
+        std::process::exit(forensics::run_child(scenario, sig_hex, n_f32, args.key_file.as_deref()));
     }
 
     if args.forensics {
-        std::process::exit(forensics::run_parent());
+        std::process::exit(forensics::run_parent(args.key_file.as_deref()));
+    }
+
+    if let Some(path) = &args.gen_key {
+        run_gen_key(path);
+        return;
     }
 
     if args.verify {
@@ -456,17 +540,25 @@ fn main() {
         assert!(buf.audit_is_zero());
         println!("[ok] The scrubbed buffer reads back as all zero.");
         println!("     This checks the buffer itself only. For copies elsewhere in the");
-        println!("     process, run: cargo run --release -- --forensics");
+        println!("     process, run: cargo run --release -- --forensics --key-file assets/demo.key");
         return;
     }
 
+    if let Some((input, output)) = &args.seal {
+        let key = load_key(args.key_file.as_deref());
+        run_seal(input, output, args.force, &key);
+        return;
+    }
+
+    let key = load_key(args.key_file.as_deref());
+
     if args.benchmark {
-        run_side_by_side_benchmark(&args.prompt, args.tokens, args.reps);
+        run_side_by_side_benchmark(&args.prompt, args.tokens, args.reps, &key);
         return;
     }
 
     match args.mode.as_str() {
-        "monolithic" => run_monolithic_generation(&args.prompt, args.tokens, args.verbose),
-        _ => run_ephemeral_generation(&args.prompt, args.tokens, args.verbose),
+        "monolithic" => run_monolithic_generation(&args.prompt, args.tokens, args.verbose, &key),
+        _ => run_ephemeral_generation(&args.prompt, args.tokens, args.verbose, &key),
     }
 }

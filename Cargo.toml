@@ -2,6 +2,6 @@
 name = "ephemeral-slm-research"
 version = "0.1.0"
 edition = "2021"
-description = "Safe toy demo of source-embedded model parameters, runtime reconstruction, inference, and observable cleanup"
+description = "Research testbed: an INT8 micro-transformer sealed with ChaCha20-Poly1305, decrypted and dequantized one layer at a time, wiped after use, and checked with a process-memory scan"
 
 [dependencies]

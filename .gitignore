@@ -2,3 +2,7 @@
 *.swp
 *.swo
 .DS_Store
+
+# Keys are secrets. Only the public demo key is tracked.
+*.key
+!assets/demo.key

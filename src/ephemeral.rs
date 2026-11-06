@@ -150,9 +150,26 @@ pub struct EphemeralMetrics {
     pub scrub_operations: usize,
     pub audits_passed: usize,
     pub audits_failed: usize,
+    /// Encrypted sections that were decrypted (each into its own transient buffer).
+    pub sections_opened: usize,
+    /// Bytes of decrypted INT8 plaintext that were wiped after dequantization.
+    pub plaintext_bytes_wiped: usize,
+    /// Largest decrypted INT8 section held at one time.
+    pub peak_plaintext_bytes: usize,
 }
 
 impl EphemeralMetrics {
+    /// Record that a decrypted INT8 section of `bytes` was wiped, and whether the
+    /// read-back audit found it all zero. Counted in the same audit totals as the f32 buffers.
+    pub fn record_plaintext_wipe(&mut self, bytes: usize, clean: bool) {
+        self.sections_opened += 1;
+        self.plaintext_bytes_wiped += bytes;
+        if bytes > self.peak_plaintext_bytes {
+            self.peak_plaintext_bytes = bytes;
+        }
+        self.record_audit(clean);
+    }
+
     pub fn record_allocation(&mut self, bytes: usize) {
         self.total_allocations += 1;
         self.total_bytes_allocated += bytes;

@@ -1,31 +1,43 @@
-//! Process-memory forensics: look for residual copies of decompressed weights.
+//! Process-memory forensics: look for residual copies of decrypted or decompressed weights.
 //!
 //! The `SecureBuffer` audits only re-read the buffer that was just overwritten, so they
 //! cannot tell whether a copy survives somewhere else. This module answers that question
-//! empirically instead: it takes short byte signatures of the *decompressed* f32 weights
-//! (what the model looks like once rebuilt from INT8) and scans every readable and
-//! writable region of the current process's address space for them.
+//! empirically instead. It takes short byte signatures of two things the model passes
+//! through on its way from the sealed payload to a forward pass:
+//!
+//! - **f32 signatures**: the *decompressed* weights (what the model looks like once rebuilt
+//!   from INT8);
+//! - **int8 signatures**: the *decrypted* INT8 weights (what a section looks like right
+//!   after it comes out of the cipher).
+//!
+//! It then scans every readable and writable region of the current process's address space
+//! for them, at every byte offset.
 //!
 //! How the experiment is kept honest:
 //! - Each scenario runs in its **own child process**, so residue from one scenario cannot
 //!   leak into another.
-//! - Signatures are computed by the **parent** and handed to the child as ASCII hex on the
-//!   command line, so the child never has the raw bytes in memory except in one buffer
-//!   whose address range is excluded from the scan. (ASCII hex cannot match.)
-//! - `monolithic-live` is a positive control: weights are deliberately still resident, so
-//!   the scan must find them. If it does not, the scanner is broken and the other results
-//!   mean nothing.
+//! - Signatures are computed by the **parent** (which holds the key and decrypts the model
+//!   once) and handed to the child as ASCII hex on the command line, so the child never has
+//!   the raw bytes in memory except in one buffer whose address range is excluded from the
+//!   scan. (ASCII hex cannot match.)
+//! - Two **positive controls** deliberately leave weights in memory, so the scan must find
+//!   them: `monolithic-live` for f32 and `plaintext-live` for decrypted INT8. If either
+//!   finds nothing, the scanner is broken and the other results mean nothing.
 //!
-//! Scope: macOS only (Mach `mach_vm_region`). Read-only mappings are skipped because
-//! dequantized floats written at runtime cannot live there; the INT8 payload in `.rodata`
-//! holds `i8`, which cannot match an `f32` signature. This does not look at registers,
-//! swap, hibernation images or other processes.
+//! Scope: macOS only (Mach `mach_vm_region`). Read-only mappings are skipped: the sealed
+//! payload in `.rodata` is ciphertext and could not match a plaintext signature anyway.
+//! This does not look at registers, swap, hibernation images or other processes.
 
+use crate::ephemeral::volatile_zero;
 use crate::model::{EphemeralSLM, MonolithicSLM};
+use crate::seal::{SealError, SealedPayload, SecretKey};
 use crate::telemetry::TelemetryLogger;
-use crate::weights::{PayloadView, QuantizedSlice, EMBEDDED_MODEL_PAYLOAD};
+use crate::weights::{
+    parse_embedding_section, parse_final_section, parse_layer_section, PayloadView, QuantizedSlice,
+    EMBEDDED_SEALED_PAYLOAD,
+};
 
-/// Signature length in bytes: 8 consecutive `f32` values.
+/// Signature length in bytes: 8 consecutive `f32` values, or 32 consecutive INT8 values.
 pub const SIG_LEN: usize = 32;
 const SIG_FLOATS: usize = SIG_LEN / 4;
 
@@ -33,7 +45,7 @@ const SIG_FLOATS: usize = SIG_LEN / 4;
 const SCENARIO_TOKENS: usize = 20;
 const PROMPT: &[u8] = b"The ephemeral ";
 
-/// What the parent expects of a scenario.
+/// What the parent expects of one class of signature in a scenario.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expect {
     /// Must find residue; proves the scanner works.
@@ -44,20 +56,93 @@ pub enum Expect {
     Informational,
 }
 
-pub const SCENARIOS: &[(&str, Expect, &str)] = &[
-    ("monolithic-live", Expect::PositiveControl, "all weights resident, no cleanup"),
-    ("streaming-no-scrub", Expect::Informational, "stream tensors through plain Vecs, never zeroed"),
-    ("monolithic-naive", Expect::Informational, "fill(0.0) cleanup, model still allocated"),
-    ("monolithic-naive-dropped", Expect::Informational, "fill(0.0) cleanup, then drop the model"),
-    ("monolithic-secure", Expect::Clean, "volatile cleanup, model still allocated"),
-    ("ephemeral", Expect::Clean, "layer streaming + volatile scrub, after generation"),
+impl Expect {
+    fn holds(self, hits: usize) -> bool {
+        match self {
+            Expect::PositiveControl => hits > 0,
+            Expect::Clean => hits == 0,
+            Expect::Informational => true,
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Expect::PositiveControl => ">0",
+            Expect::Clean => "=0",
+            Expect::Informational => "info",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Scenario {
+    pub name: &'static str,
+    /// Expectation for decompressed f32 weights.
+    pub f32_expect: Expect,
+    /// Expectation for decrypted INT8 plaintext.
+    pub i8_expect: Expect,
+    pub desc: &'static str,
+}
+
+pub const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "monolithic-live",
+        f32_expect: Expect::PositiveControl,
+        i8_expect: Expect::Clean,
+        desc: "all f32 weights resident; decrypted INT8 wiped at load",
+    },
+    Scenario {
+        name: "plaintext-live",
+        f32_expect: Expect::Clean,
+        i8_expect: Expect::PositiveControl,
+        desc: "every section decrypted into plain Vecs and kept",
+    },
+    Scenario {
+        name: "streaming-no-scrub",
+        f32_expect: Expect::Informational,
+        i8_expect: Expect::Informational,
+        desc: "decrypt + dequantize through plain Vecs, never zeroed",
+    },
+    Scenario {
+        name: "monolithic-naive",
+        f32_expect: Expect::Informational,
+        i8_expect: Expect::Clean,
+        desc: "fill(0.0) cleanup, model still allocated",
+    },
+    Scenario {
+        name: "monolithic-naive-dropped",
+        f32_expect: Expect::Informational,
+        i8_expect: Expect::Clean,
+        desc: "fill(0.0) cleanup, then drop the model",
+    },
+    Scenario {
+        name: "monolithic-secure",
+        f32_expect: Expect::Clean,
+        i8_expect: Expect::Clean,
+        desc: "volatile cleanup, model still allocated",
+    },
+    Scenario {
+        name: "ephemeral",
+        f32_expect: Expect::Clean,
+        i8_expect: Expect::Clean,
+        desc: "layer decrypt + volatile scrub, after generation",
+    },
 ];
 
-/// A labelled byte signature of decompressed weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigKind {
+    /// Decompressed f32 weights.
+    F32,
+    /// Decrypted INT8 plaintext.
+    Int8,
+}
+
+/// A labelled byte signature.
 #[derive(Debug, Clone)]
 pub struct Signature {
     pub label: String,
     pub bytes: [u8; SIG_LEN],
+    pub kind: SigKind,
 }
 
 /// Result of one memory scan.
@@ -79,7 +164,7 @@ impl ScanReport {
 // Signatures and hex transport
 // ---------------------------------------------------------------------------
 
-fn signature_for(label: &str, tensor: &QuantizedSlice) -> Option<Signature> {
+fn signature_for_f32(label: &str, tensor: &QuantizedSlice) -> Option<Signature> {
     let mut vals = vec![0.0_f32; tensor.num_elements()];
     tensor.dequantize_into(&mut vals);
     if vals.len() < SIG_FLOATS {
@@ -108,34 +193,76 @@ fn signature_for(label: &str, tensor: &QuantizedSlice) -> Option<Signature> {
             return Some(Signature {
                 label: label.to_string(),
                 bytes,
+                kind: SigKind::F32,
             });
         }
     }
     None
 }
 
-/// Build signatures from the embedded payload. Call this in the parent only.
-pub fn compute_signatures() -> Vec<Signature> {
-    let payload = PayloadView::parse(EMBEDDED_MODEL_PAYLOAD).expect("valid embedded payload");
-    let last = payload.config.n_layers - 1;
-    let (tok, pos) = payload.get_embeddings();
-    let l0 = payload.get_layer_slices(0);
-    let ln = payload.get_layer_slices(last);
-    let (_, head) = payload.get_final_slices();
+fn signature_for_i8(label: &str, tensor: &QuantizedSlice) -> Option<Signature> {
+    let data = tensor.data;
+    if data.len() < SIG_LEN {
+        return None;
+    }
+    // Middle of the tensor, for the same allocator reason as the f32 signatures.
+    let first = (data.len() / 2) & !3;
+    for start in (first..=data.len() - SIG_LEN).step_by(4) {
+        let window = &data[start..start + SIG_LEN];
+        let mut seen = [false; 256];
+        for &b in window {
+            seen[b as u8 as usize] = true;
+        }
+        // Many distinct byte values, so the window cannot be a zero run or a short repeat.
+        if seen.iter().filter(|&&s| s).count() >= 12 {
+            let mut bytes = [0u8; SIG_LEN];
+            for (i, &b) in window.iter().enumerate() {
+                bytes[i] = b as u8;
+            }
+            return Some(Signature {
+                label: format!("i8:{label}"),
+                bytes,
+                kind: SigKind::Int8,
+            });
+        }
+    }
+    None
+}
 
-    let tensors: [(&str, QuantizedSlice); 7] = [
-        ("tok_emb", tok),
-        ("pos_emb", pos),
-        ("l0.wq", l0.wq),
-        ("l0.w1", l0.w1),
-        ("ln.wo", ln.wo),
-        ("ln.w2", ln.w2),
-        ("head", head),
-    ];
-    tensors
-        .iter()
-        .filter_map(|(label, t)| signature_for(label, t))
-        .collect()
+/// Build signatures by decrypting the embedded payload. Call this in the parent only: it
+/// holds the whole model in the clear for the duration of the call, then wipes it.
+///
+/// The f32 signatures come first, then the INT8 ones.
+pub fn compute_signatures(key: &SecretKey) -> Result<Vec<Signature>, SealError> {
+    let sealed = SealedPayload::parse(EMBEDDED_SEALED_PAYLOAD)?;
+    let mut plain = sealed.open_all(key)?;
+    let sigs = {
+        let payload = PayloadView::parse(&plain)
+            .map_err(|_| SealError::Malformed("decrypted payload does not parse"))?;
+        let last = payload.config.n_layers - 1;
+        let (tok, pos) = payload.get_embeddings();
+        let l0 = payload.get_layer_slices(0);
+        let ln = payload.get_layer_slices(last);
+        let (_, head) = payload.get_final_slices();
+
+        let tensors: [(&str, QuantizedSlice); 7] = [
+            ("tok_emb", tok),
+            ("pos_emb", pos),
+            ("l0.wq", l0.wq),
+            ("l0.w1", l0.w1),
+            ("ln.wo", ln.wo),
+            ("ln.w2", ln.w2),
+            ("head", head),
+        ];
+        let mut sigs: Vec<Signature> = tensors
+            .iter()
+            .filter_map(|(label, t)| signature_for_f32(label, t))
+            .collect();
+        sigs.extend(tensors.iter().filter_map(|(label, t)| signature_for_i8(label, t)));
+        sigs
+    };
+    volatile_zero(&mut plain);
+    Ok(sigs)
 }
 
 pub fn to_hex(bytes: &[u8]) -> String {
@@ -205,7 +332,8 @@ fn all_zero(buf: &[u8]) -> bool {
     pre.iter().all(|&b| b == 0) && mid.iter().all(|&w| w == 0) && post.iter().all(|&b| b == 0)
 }
 
-/// Scan every readable+writable region of the current process for the signatures.
+/// Scan every readable+writable region of the current process for the signatures, at
+/// every byte offset.
 ///
 /// `sigs` is a flat buffer of `n * SIG_LEN` bytes. Hits that fall inside any of the
 /// `exclude` address ranges (the caller's own signature storage) are ignored, as is the
@@ -219,10 +347,15 @@ pub fn scan_self(sigs: &[u8], exclude: &[(usize, usize)]) -> Result<ScanReport, 
     let first_words: Vec<u32> = (0..n)
         .map(|i| u32::from_ne_bytes(sigs[i * SIG_LEN..i * SIG_LEN + 4].try_into().unwrap()))
         .collect();
+    // Cheap pre-filter: only offsets whose first byte starts some signature are compared.
+    let mut first_byte = [false; 256];
+    for i in 0..n {
+        first_byte[sigs[i * SIG_LEN] as usize] = true;
+    }
 
     const CHUNK: usize = 1 << 20;
     // Consecutive chunks overlap by SIG_LEN bytes so a match straddling a boundary is
-    // found exactly once. ADVANCE is a multiple of 4 so f32 alignment is preserved.
+    // found exactly once.
     const ADVANCE: usize = CHUNK - SIG_LEN;
 
     let mut buf = vec![0u8; CHUNK];
@@ -287,8 +420,10 @@ pub fn scan_self(sigs: &[u8], exclude: &[(usize, usize)]) -> Result<ScanReport, 
                             // Start offsets this chunk is responsible for.
                             let limit = if last { got } else { ADVANCE }
                                 .min(got.saturating_sub(SIG_LEN - 1));
-                            let mut off = 0;
-                            while off < limit {
+                            for off in 0..limit {
+                                if !first_byte[data[off] as usize] {
+                                    continue;
+                                }
                                 let word = u32::from_ne_bytes(data[off..off + 4].try_into().unwrap());
                                 for (i, &fw) in first_words.iter().enumerate() {
                                     if word == fw
@@ -303,7 +438,6 @@ pub fn scan_self(sigs: &[u8], exclude: &[(usize, usize)]) -> Result<ScanReport, 
                                         }
                                     }
                                 }
-                                off += 4;
                             }
                         }
                     }
@@ -349,58 +483,95 @@ fn generate_monolithic(model: &MonolithicSLM) {
     std::hint::black_box(&ids);
 }
 
-fn generate_ephemeral(model: &mut EphemeralSLM) {
+fn generate_ephemeral(model: &mut EphemeralSLM) -> Result<(), String> {
     let telemetry = TelemetryLogger::new(false);
     let ctx_len = model.config().ctx_len;
     let mut ids = PROMPT.to_vec();
     for _ in 0..SCENARIO_TOKENS {
         let start = ids.len().saturating_sub(ctx_len);
-        let logits = model.forward_ephemeral(&ids[start..], &telemetry);
+        let logits = model
+            .forward_ephemeral(&ids[start..], &telemetry)
+            .map_err(|e| e.to_string())?;
         ids.push(argmax(&logits));
     }
     std::hint::black_box(&ids);
+    Ok(())
 }
 
-/// Negative control: stream every tensor through a plain `Vec<f32>` and free it without
-/// ever zeroing it. Shows what "streaming without scrubbing" leaves behind.
-fn stream_without_scrub() {
-    let payload = PayloadView::parse(EMBEDDED_MODEL_PAYLOAD).expect("valid embedded payload");
-    let mut tensors: Vec<QuantizedSlice> = Vec::new();
-    let (tok, pos) = payload.get_embeddings();
-    tensors.push(tok);
-    tensors.push(pos);
-    for l in 0..payload.config.n_layers {
-        let s = payload.get_layer_slices(l);
-        tensors.extend([s.wq, s.wk, s.wv, s.wo, s.w1, s.w2]);
+fn err_string(e: SealError) -> String {
+    e.to_string()
+}
+
+/// Decrypt every section into plain `Vec<u8>`s that nothing ever zeroes.
+fn decrypt_into_plain_vecs(sealed: &SealedPayload, key: &SecretKey) -> Result<Vec<Vec<u8>>, String> {
+    let mut sections = Vec::with_capacity(sealed.section_count());
+    for i in 0..sealed.section_count() {
+        let mut plain = vec![0u8; sealed.section_plain_len(i)];
+        sealed.open_section(i, key, &mut plain).map_err(err_string)?;
+        sections.push(plain);
     }
-    let (_, head) = payload.get_final_slices();
-    tensors.push(head);
-    for t in tensors {
-        let mut v = vec![0.0_f32; t.num_elements()];
-        t.dequantize_into(&mut v);
-        std::hint::black_box(&v);
-        drop(v);
+    Ok(sections)
+}
+
+/// Negative control: decrypt each section into a plain `Vec<u8>`, dequantize its tensors
+/// into plain `Vec<f32>`s, and free everything without ever zeroing it. Shows what
+/// "streaming without scrubbing" leaves behind, for both signature classes.
+fn stream_without_scrub(key: &SecretKey) -> Result<(), String> {
+    let sealed = SealedPayload::parse(EMBEDDED_SEALED_PAYLOAD).map_err(err_string)?;
+    let last = sealed.section_count() - 1;
+    for i in 0..sealed.section_count() {
+        let mut plain = vec![0u8; sealed.section_plain_len(i)];
+        sealed.open_section(i, key, &mut plain).map_err(err_string)?;
+        {
+            let tensors: Vec<QuantizedSlice> = if i == 0 {
+                let (tok, pos) = parse_embedding_section(&plain);
+                vec![tok, pos]
+            } else if i == last {
+                let (_, head) = parse_final_section(&plain);
+                vec![head]
+            } else {
+                let s = parse_layer_section(&plain);
+                vec![s.wq, s.wk, s.wv, s.wo, s.w1, s.w2]
+            };
+            for t in tensors {
+                let mut v = vec![0.0_f32; t.num_elements()];
+                t.dequantize_into(&mut v);
+                std::hint::black_box(&v);
+                drop(v);
+            }
+        }
+        std::hint::black_box(&plain);
+        drop(plain);
     }
+    Ok(())
 }
 
 /// Run one scenario in this process and return the scan report. `sigs` must be the flat
 /// signature buffer produced by [`from_hex`].
-pub fn run_scenario(name: &str, sigs: &[u8]) -> Result<ScanReport, String> {
+pub fn run_scenario(name: &str, sigs: &[u8], key: &SecretKey) -> Result<ScanReport, String> {
     let exclude = [(sigs.as_ptr() as usize, sigs.as_ptr() as usize + sigs.len())];
     match name {
         "monolithic-live" => {
-            let model = MonolithicSLM::new();
+            let model = MonolithicSLM::open(key).map_err(err_string)?;
             generate_monolithic(&model);
             let r = scan_self(sigs, &exclude);
             std::hint::black_box(&model);
             r
         }
+        "plaintext-live" => {
+            let sealed = SealedPayload::parse(EMBEDDED_SEALED_PAYLOAD).map_err(err_string)?;
+            let held = decrypt_into_plain_vecs(&sealed, key)?;
+            std::hint::black_box(&held);
+            let r = scan_self(sigs, &exclude);
+            std::hint::black_box(&held);
+            r
+        }
         "streaming-no-scrub" => {
-            stream_without_scrub();
+            stream_without_scrub(key)?;
             scan_self(sigs, &exclude)
         }
         "monolithic-naive" => {
-            let mut model = MonolithicSLM::new();
+            let mut model = MonolithicSLM::open(key).map_err(err_string)?;
             generate_monolithic(&model);
             model.cleanup_naive();
             let r = scan_self(sigs, &exclude);
@@ -408,14 +579,14 @@ pub fn run_scenario(name: &str, sigs: &[u8]) -> Result<ScanReport, String> {
             r
         }
         "monolithic-naive-dropped" => {
-            let mut model = MonolithicSLM::new();
+            let mut model = MonolithicSLM::open(key).map_err(err_string)?;
             generate_monolithic(&model);
             model.cleanup_naive();
             drop(model);
             scan_self(sigs, &exclude)
         }
         "monolithic-secure" => {
-            let mut model = MonolithicSLM::new();
+            let mut model = MonolithicSLM::open(key).map_err(err_string)?;
             generate_monolithic(&model);
             model.cleanup();
             let r = scan_self(sigs, &exclude);
@@ -423,8 +594,8 @@ pub fn run_scenario(name: &str, sigs: &[u8]) -> Result<ScanReport, String> {
             r
         }
         "ephemeral" => {
-            let mut model = EphemeralSLM::new();
-            generate_ephemeral(&mut model);
+            let mut model = EphemeralSLM::open(key).map_err(err_string)?;
+            generate_ephemeral(&mut model)?;
             let r = scan_self(sigs, &exclude);
             std::hint::black_box(&model);
             r
@@ -433,9 +604,24 @@ pub fn run_scenario(name: &str, sigs: &[u8]) -> Result<ScanReport, String> {
     }
 }
 
-/// Entry point for a child process: decode signatures, run the scenario, print one
-/// machine-readable `RESULT` line.
-pub fn run_child(scenario: &str, sig_hex: &str) -> i32 {
+/// Entry point for a child process: load the key, decode signatures, run the scenario,
+/// print one machine-readable `RESULT` line. `n_f32` says how many of the leading
+/// signatures are f32 signatures (the rest are INT8).
+pub fn run_child(scenario: &str, sig_hex: &str, n_f32: &str, key_file: Option<&str>) -> i32 {
+    let key = match SecretKey::from_cli(key_file) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("forensics child: {e}");
+            return 2;
+        }
+    };
+    let n_f32: usize = match n_f32.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            eprintln!("forensics child: bad signature split {n_f32:?}");
+            return 2;
+        }
+    };
     let sigs = match from_hex(sig_hex) {
         Ok(s) => s,
         Err(e) => {
@@ -443,13 +629,17 @@ pub fn run_child(scenario: &str, sig_hex: &str) -> i32 {
             return 2;
         }
     };
-    match run_scenario(scenario, &sigs) {
+    match run_scenario(scenario, &sigs, &key) {
         Ok(r) => {
+            let split = n_f32.min(r.hits.len());
+            let f32_hits: usize = r.hits[..split].iter().sum();
+            let i8_hits: usize = r.hits[split..].iter().sum();
             let per_sig: Vec<String> = r.hits.iter().map(|h| h.to_string()).collect();
             println!(
-                "RESULT scenario={} hits={} per_sig={} regions={} mib_scanned={:.1}",
+                "RESULT scenario={} f32={} i8={} per_sig={} regions={} mib_scanned={:.1}",
                 scenario,
-                r.total_hits(),
+                f32_hits,
+                i8_hits,
                 per_sig.join(","),
                 r.regions_scanned,
                 r.bytes_scanned as f64 / (1024.0 * 1024.0)
@@ -467,7 +657,8 @@ pub fn run_child(scenario: &str, sig_hex: &str) -> i32 {
 #[derive(Debug, Clone)]
 pub struct ScenarioResult {
     pub scenario: String,
-    pub hits: usize,
+    pub f32_hits: usize,
+    pub i8_hits: usize,
     pub per_sig: Vec<usize>,
     pub mib_scanned: f64,
 }
@@ -480,7 +671,8 @@ fn parse_result(stdout: &str) -> Option<ScenarioResult> {
     };
     Some(ScenarioResult {
         scenario: field("scenario")?.to_string(),
-        hits: field("hits")?.parse().ok()?,
+        f32_hits: field("f32")?.parse().ok()?,
+        i8_hits: field("i8")?.parse().ok()?,
         per_sig: field("per_sig")?
             .split(',')
             .filter_map(|s| s.parse().ok())
@@ -489,14 +681,30 @@ fn parse_result(stdout: &str) -> Option<ScenarioResult> {
     })
 }
 
-/// Parent entry point: compute signatures once, run every scenario in a fresh child
-/// process, print a table, and return a process exit code (0 = all assertions held).
-pub fn run_parent() -> i32 {
+/// Parent entry point: decrypt once to compute signatures, run every scenario in a fresh
+/// child process, print a table, and return a process exit code (0 = all assertions held).
+/// `key_file` is passed on to the children (they otherwise inherit `ESLM_KEY`).
+pub fn run_parent(key_file: Option<&str>) -> i32 {
     if !is_supported() {
         println!("[forensics] process-memory scanning is only implemented for macOS; skipping.");
         return 0;
     }
-    let sigs = compute_signatures();
+    let key = match SecretKey::from_cli(key_file) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[forensics] {e}");
+            return 2;
+        }
+    };
+    let sigs = match compute_signatures(&key) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[forensics] cannot build signatures: {e}");
+            return 2;
+        }
+    };
+    drop(key);
+    let n_f32 = sigs.iter().filter(|s| s.kind == SigKind::F32).count();
     let flat: Vec<u8> = sigs.iter().flat_map(|s| s.bytes).collect();
     let hex = to_hex(&flat);
     let exe = match std::env::current_exe() {
@@ -507,49 +715,67 @@ pub fn run_parent() -> i32 {
         }
     };
 
-    println!("[forensics] {} signatures ({} bytes each) from decompressed weights:", sigs.len(), SIG_LEN);
-    println!("            {}", sigs.iter().map(|s| s.label.as_str()).collect::<Vec<_>>().join(", "));
-    println!("[forensics] one child process per scenario; scanning all rw- regions\n");
-    println!("{:<26} {:<14} {:>6}  verdict", "scenario", "expectation", "hits");
-    println!("{}", "-".repeat(78));
+    println!(
+        "[forensics] {} signatures of {} bytes: {} decompressed f32 + {} decrypted INT8",
+        sigs.len(),
+        SIG_LEN,
+        n_f32,
+        sigs.len() - n_f32
+    );
+    println!(
+        "            tensors: {}",
+        sigs.iter()
+            .filter(|s| s.kind == SigKind::F32)
+            .map(|s| s.label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!("[forensics] one child process per scenario; scanning all rw- regions at every byte offset\n");
+    println!("{:<26} {:<12} {:<12} verdict", "scenario", "f32 weights", "int8 plain");
+    println!("{}", "-".repeat(96));
 
     let mut failures = 0;
-    for &(name, expect, desc) in SCENARIOS {
-        let out = std::process::Command::new(&exe)
-            .args(["--forensics-child", name, &hex])
-            .output();
-        let result = match out {
+    for sc in SCENARIOS {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["--forensics-child", sc.name, &hex, &n_f32.to_string()]);
+        if let Some(path) = key_file {
+            cmd.args(["--key-file", path]);
+        }
+        let result = match cmd.output() {
             Ok(o) if o.status.success() => parse_result(&String::from_utf8_lossy(&o.stdout)),
             Ok(o) => {
-                eprintln!("child {name} failed: {}", String::from_utf8_lossy(&o.stderr));
+                eprintln!("child {} failed: {}", sc.name, String::from_utf8_lossy(&o.stderr));
                 None
             }
             Err(e) => {
-                eprintln!("could not spawn child {name}: {e}");
+                eprintln!("could not spawn child {}: {e}", sc.name);
                 None
             }
         };
         let Some(r) = result else {
-            println!("{:<26} {:<14} {:>6}  ERROR", name, "-", "-");
+            println!("{:<26} {:<12} {:<12} ERROR", sc.name, "-", "-");
             failures += 1;
             continue;
         };
-        let (label, ok) = match expect {
-            Expect::PositiveControl => ("must find >0", r.hits > 0),
-            Expect::Clean => ("must find 0", r.hits == 0),
-            Expect::Informational => ("informational", true),
-        };
+        let ok = sc.f32_expect.holds(r.f32_hits) && sc.i8_expect.holds(r.i8_hits);
         if !ok {
             failures += 1;
         }
-        let verdict = match (expect, ok) {
-            (_, false) => "FAIL".to_string(),
-            (Expect::Informational, _) => format!("(reported) {desc}"),
-            _ => format!("ok   {desc}"),
+        let both_info = sc.f32_expect == Expect::Informational && sc.i8_expect == Expect::Informational;
+        let verdict = match (ok, both_info) {
+            (false, _) => "FAIL".to_string(),
+            (true, true) => format!("(reported) {}", sc.desc),
+            (true, false) => format!("ok   {}", sc.desc),
         };
-        println!("{:<26} {:<14} {:>6}  {}", r.scenario, label, r.hits, verdict);
+        println!(
+            "{:<26} {:<12} {:<12} {}",
+            r.scenario,
+            format!("{:>3} {}", r.f32_hits, sc.f32_expect.tag()),
+            format!("{:>3} {}", r.i8_hits, sc.i8_expect.tag()),
+            verdict
+        );
     }
-    println!();
+    println!("\n(>0 = positive control, must find; =0 = must find nothing; info = reported only)");
     if failures == 0 {
         println!("[forensics] all assertions held");
         0
@@ -563,6 +789,11 @@ pub fn run_parent() -> i32 {
 mod tests {
     use super::*;
 
+    fn demo_key() -> SecretKey {
+        SecretKey::from_file(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/demo.key"))
+            .expect("assets/demo.key must exist for the tests")
+    }
+
     #[test]
     fn hex_roundtrip() {
         let bytes: Vec<u8> = (0..=255).collect();
@@ -573,8 +804,12 @@ mod tests {
 
     #[test]
     fn signatures_are_distinct_and_nonzero() {
-        let sigs = compute_signatures();
-        assert_eq!(sigs.len(), 7);
+        let sigs = compute_signatures(&demo_key()).unwrap();
+        assert_eq!(sigs.iter().filter(|s| s.kind == SigKind::F32).count(), 7);
+        assert_eq!(sigs.iter().filter(|s| s.kind == SigKind::Int8).count(), 7);
+        // f32 signatures must come first: the child splits the hit list by position.
+        let first_i8 = sigs.iter().position(|s| s.kind == SigKind::Int8).unwrap();
+        assert!(sigs[first_i8..].iter().all(|s| s.kind == SigKind::Int8));
         for s in &sigs {
             assert!(s.bytes.iter().any(|&b| b != 0), "{} is all zero", s.label);
         }
@@ -584,10 +819,11 @@ mod tests {
         assert_eq!(uniq.len(), sigs.len());
     }
 
-    /// The scanner must see a known pattern in the heap, and stop seeing it after it is
-    /// zeroed. Uses a delta so unrelated stack copies of the pattern cannot interfere.
+    /// The scanner must see known patterns in the heap at *any* byte offset, and stop seeing
+    /// them after they are zeroed. Uses a delta so unrelated stack copies of the pattern
+    /// cannot interfere.
     #[test]
-    fn scanner_finds_and_loses_a_planted_pattern() {
+    fn scanner_finds_and_loses_planted_patterns_at_any_alignment() {
         // A pattern that does not occur anywhere else.
         let mut sig = Vec::with_capacity(SIG_LEN);
         for i in 0..SIG_LEN as u8 {
@@ -595,8 +831,11 @@ mod tests {
         }
         let exclude = [(sig.as_ptr() as usize, sig.as_ptr() as usize + SIG_LEN)];
 
+        // One aligned copy and two deliberately misaligned ones.
         let mut planted = vec![0u8; 4096];
-        planted[100..100 + SIG_LEN].copy_from_slice(&sig);
+        for offset in [100, 201, 302] {
+            planted[offset..offset + SIG_LEN].copy_from_slice(&sig);
+        }
         std::hint::black_box(&planted);
 
         let with = scan_self(&sig, &exclude).unwrap();
@@ -606,12 +845,10 @@ mod tests {
         std::hint::black_box(&planted);
         let without = scan_self(&sig, &exclude).unwrap();
 
-        // `planted[100..]` is not 4-byte aligned relative to the allocation unless the
-        // offset is; 100 is a multiple of 4, so the scanner (step 4) sees it.
         assert_eq!(
             with.total_hits(),
-            without.total_hits() + 1,
-            "scanner should lose exactly the planted copy"
+            without.total_hits() + 3,
+            "scanner should lose exactly the three planted copies"
         );
     }
 }

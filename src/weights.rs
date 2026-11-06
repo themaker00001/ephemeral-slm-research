@@ -1,12 +1,17 @@
-//! Source-embedded model payload and INT8 quantization decoding.
+//! Model payload: INT8 quantization decoding and the sealed (encrypted) payload that is
+//! embedded in the executable.
 //!
-//! Models parameters are stored as symmetric INT8 quantized arrays with per-tensor
-//! FP32 scales. The weights binary is embedded directly into the executable's
-//! `.rodata` section at compile time via `include_bytes!`.
+//! Parameters are stored as symmetric INT8 arrays with per-tensor FP32 scales. The
+//! executable embeds the model only in **sealed** form (`assets/weights.enc`, see
+//! [`crate::seal`]): ChaCha20-Poly1305 ciphertext with one section per layer. The plaintext
+//! layout parsed here ([`PayloadView`] and the `parse_*_section` functions) is what a
+//! section contains after it has been decrypted into a scratch buffer.
 
 use std::convert::TryInto;
 
-pub static EMBEDDED_MODEL_PAYLOAD: &[u8] = include_bytes!("../assets/weights.bin");
+/// The model as shipped in the executable: encrypted and authenticated, one section per
+/// layer. It is useless without the key, which is never embedded.
+pub static EMBEDDED_SEALED_PAYLOAD: &[u8] = include_bytes!("../assets/weights.enc");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelConfig {
@@ -19,7 +24,24 @@ pub struct ModelConfig {
     pub d_ff: usize,
 }
 
-/// A slice referencing quantized INT8 data directly from the read-only static binary payload.
+impl ModelConfig {
+    /// Decode the 7 little-endian `u32` config words (version, vocab, ctx, d_model,
+    /// n_layers, n_heads, d_ff). `bytes` must hold at least 28 bytes.
+    pub fn from_le_bytes(bytes: &[u8]) -> Self {
+        let word = |i: usize| u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap());
+        Self {
+            version: word(0),
+            vocab_size: word(1) as usize,
+            ctx_len: word(2) as usize,
+            d_model: word(3) as usize,
+            n_layers: word(4) as usize,
+            n_heads: word(5) as usize,
+            d_ff: word(6) as usize,
+        }
+    }
+}
+
+/// A slice referencing quantized INT8 data inside a payload or a decrypted section.
 #[derive(Debug, Clone, Copy)]
 pub struct QuantizedSlice<'a> {
     pub scale: f32,
@@ -52,9 +74,9 @@ impl<'a> QuantizedSlice<'a> {
 /// Raw little-endian FP32 weights (used for small 1D normalization vectors where
 /// quantization offers minimal gain).
 ///
-/// The bytes are kept as `&[u8]` and decoded with `f32::from_le_bytes`. The payload comes
-/// from `include_bytes!`, which only guarantees 1-byte alignment, so reinterpreting it as
-/// `&[f32]` would be undefined behaviour whenever an offset is not 4-byte aligned.
+/// The bytes are kept as `&[u8]` and decoded with `f32::from_le_bytes`. A payload only
+/// guarantees 1-byte alignment, so reinterpreting it as `&[f32]` would be undefined
+/// behaviour whenever an offset is not 4-byte aligned.
 #[derive(Debug, Clone, Copy)]
 pub struct Fp32Slice<'a> {
     bytes: &'a [u8],
@@ -82,7 +104,90 @@ impl<'a> Fp32Slice<'a> {
     }
 }
 
-/// Lightweight, zero-copy view over the embedded model payload.
+pub struct LayerSlices<'a> {
+    pub norm1: Fp32Slice<'a>,
+    pub wq: QuantizedSlice<'a>,
+    pub wk: QuantizedSlice<'a>,
+    pub wv: QuantizedSlice<'a>,
+    pub wo: QuantizedSlice<'a>,
+    pub norm2: Fp32Slice<'a>,
+    pub w1: QuantizedSlice<'a>,
+    pub w2: QuantizedSlice<'a>,
+}
+
+// ---------------------------------------------------------------------------
+// Plaintext section parsing (works on any byte buffer, e.g. a decrypted section)
+// ---------------------------------------------------------------------------
+
+static MAT_SHAPE: [usize; 2] = [48, 48];
+static W1_SHAPE: [usize; 2] = [96, 48];
+static W2_SHAPE: [usize; 2] = [48, 96];
+static TOK_SHAPE: [usize; 2] = [128, 48];
+static POS_SHAPE: [usize; 2] = [32, 48];
+static HEAD_SHAPE: [usize; 2] = [128, 48];
+
+fn take_quantized<'a>(buf: &'a [u8], offset: &mut usize, shape: &'static [usize]) -> QuantizedSlice<'a> {
+    let scale = f32::from_le_bytes(buf[*offset..*offset + 4].try_into().unwrap());
+    let length = u32::from_le_bytes(buf[*offset + 4..*offset + 8].try_into().unwrap()) as usize;
+    *offset += 8;
+    let byte_slice = &buf[*offset..*offset + length];
+    *offset += length;
+    // SAFETY: `i8` and `u8` have identical size and alignment (1), and every bit
+    // pattern is a valid `i8`, so this reinterpretation is sound for any offset.
+    let data = unsafe { std::slice::from_raw_parts(byte_slice.as_ptr() as *const i8, length) };
+    QuantizedSlice { scale, data, shape }
+}
+
+fn take_fp32<'a>(buf: &'a [u8], offset: &mut usize) -> Fp32Slice<'a> {
+    let byte_len = u32::from_le_bytes(buf[*offset..*offset + 4].try_into().unwrap()) as usize;
+    *offset += 4;
+    let bytes = &buf[*offset..*offset + byte_len];
+    *offset += byte_len;
+    Fp32Slice { bytes }
+}
+
+/// Parse the embeddings section: token embedding then position embedding.
+pub fn parse_embedding_section(buf: &[u8]) -> (QuantizedSlice<'_>, QuantizedSlice<'_>) {
+    let mut cur = 0;
+    let tok = take_quantized(buf, &mut cur, &TOK_SHAPE);
+    let pos = take_quantized(buf, &mut cur, &POS_SHAPE);
+    (tok, pos)
+}
+
+/// Parse one transformer layer section.
+pub fn parse_layer_section(buf: &[u8]) -> LayerSlices<'_> {
+    let mut cur = 0;
+    let norm1 = take_fp32(buf, &mut cur);
+    let wq = take_quantized(buf, &mut cur, &MAT_SHAPE);
+    let wk = take_quantized(buf, &mut cur, &MAT_SHAPE);
+    let wv = take_quantized(buf, &mut cur, &MAT_SHAPE);
+    let wo = take_quantized(buf, &mut cur, &MAT_SHAPE);
+    let norm2 = take_fp32(buf, &mut cur);
+    let w1 = take_quantized(buf, &mut cur, &W1_SHAPE);
+    let w2 = take_quantized(buf, &mut cur, &W2_SHAPE);
+    LayerSlices {
+        norm1,
+        wq,
+        wk,
+        wv,
+        wo,
+        norm2,
+        w1,
+        w2,
+    }
+}
+
+/// Parse the final section: output norm then the head.
+pub fn parse_final_section(buf: &[u8]) -> (Fp32Slice<'_>, QuantizedSlice<'_>) {
+    let mut cur = 0;
+    let norm = take_fp32(buf, &mut cur);
+    let head = take_quantized(buf, &mut cur, &HEAD_SHAPE);
+    (norm, head)
+}
+
+/// View over a **plaintext** payload (the `ESLM` layout produced by
+/// `scripts/train_export.py`). The executable no longer embeds one; this is used by the
+/// sealing tool, by tests, and to interpret decrypted sections.
 pub struct PayloadView<'a> {
     raw: &'a [u8],
     pub config: ModelConfig,
@@ -100,37 +205,16 @@ impl<'a> PayloadView<'a> {
             return Err(format!("Invalid magic bytes: {:?}", &raw[0..4]));
         }
 
-        let mut offset = 4;
-        let read_u32 = |cur: &mut usize| -> u32 {
-            let val = u32::from_le_bytes(raw[*cur..*cur + 4].try_into().unwrap());
-            *cur += 4;
-            val
-        };
+        let config = ModelConfig::from_le_bytes(&raw[4..32]);
+        let n_layers = config.n_layers;
 
-        let version = read_u32(&mut offset);
-        let vocab_size = read_u32(&mut offset) as usize;
-        let ctx_len = read_u32(&mut offset) as usize;
-        let d_model = read_u32(&mut offset) as usize;
-        let n_layers = read_u32(&mut offset) as usize;
-        let n_heads = read_u32(&mut offset) as usize;
-        let d_ff = read_u32(&mut offset) as usize;
-
-        let config = ModelConfig {
-            version,
-            vocab_size,
-            ctx_len,
-            d_model,
-            n_layers,
-            n_heads,
-            d_ff,
-        };
-
-        let embedding_offset = offset;
+        let embedding_offset = 32;
+        let mut offset = embedding_offset;
         // Skip embedding tensors to locate layer offsets
         Self::skip_quantized(raw, &mut offset)?; // tok_emb
         Self::skip_quantized(raw, &mut offset)?; // pos_emb
 
-        let mut layer_offsets = Vec::with_capacity(n_layers);
+        let mut layer_offsets = Vec::with_capacity(n_layers.min(1024));
         for _ in 0..n_layers {
             layer_offsets.push(offset);
             Self::skip_fp32(raw, &mut offset)?;      // norm1
@@ -146,6 +230,9 @@ impl<'a> PayloadView<'a> {
         let final_offset = offset;
         Self::skip_fp32(raw, &mut offset)?;      // final norm
         Self::skip_quantized(raw, &mut offset)?; // head
+        if offset != raw.len() {
+            return Err(format!("{} unexpected trailing bytes", raw.len() - offset));
+        }
 
         Ok(Self {
             raw,
@@ -180,86 +267,34 @@ impl<'a> PayloadView<'a> {
         Ok(())
     }
 
-    fn read_quantized_at(&self, offset: &mut usize, shape: &'static [usize]) -> QuantizedSlice<'a> {
-        let scale = f32::from_le_bytes(self.raw[*offset..*offset + 4].try_into().unwrap());
-        let length = u32::from_le_bytes(self.raw[*offset + 4..*offset + 8].try_into().unwrap()) as usize;
-        *offset += 8;
-        let byte_slice = &self.raw[*offset..*offset + length];
-        *offset += length;
-        // SAFETY: `i8` and `u8` have identical size and alignment (1), and every bit
-        // pattern is a valid `i8`, so this reinterpretation is sound for any offset.
-        let data = unsafe {
-            std::slice::from_raw_parts(byte_slice.as_ptr() as *const i8, length)
-        };
-        QuantizedSlice { scale, data, shape }
-    }
-
-    fn read_fp32_at(&self, offset: &mut usize, _shape: &'static [usize]) -> Fp32Slice<'a> {
-        let byte_len = u32::from_le_bytes(self.raw[*offset..*offset + 4].try_into().unwrap()) as usize;
-        *offset += 4;
-        let bytes = &self.raw[*offset..*offset + byte_len];
-        *offset += byte_len;
-        Fp32Slice { bytes }
-    }
-
     pub fn get_embeddings(&self) -> (QuantizedSlice<'a>, QuantizedSlice<'a>) {
-        let mut cur = self.embedding_offset;
-        static TOK_SHAPE: [usize; 2] = [128, 48];
-        static POS_SHAPE: [usize; 2] = [32, 48];
-        let tok = self.read_quantized_at(&mut cur, &TOK_SHAPE);
-        let pos = self.read_quantized_at(&mut cur, &POS_SHAPE);
-        (tok, pos)
+        parse_embedding_section(&self.raw[self.embedding_offset..])
     }
 
     pub fn get_layer_slices(&self, layer_idx: usize) -> LayerSlices<'a> {
-        let mut cur = self.layer_offsets[layer_idx];
-        static NORM_SHAPE: [usize; 1] = [48];
-        static MAT_SHAPE: [usize; 2] = [48, 48];
-        static W1_SHAPE: [usize; 2] = [96, 48];
-        static W2_SHAPE: [usize; 2] = [48, 96];
-
-        let norm1 = self.read_fp32_at(&mut cur, &NORM_SHAPE);
-        let wq = self.read_quantized_at(&mut cur, &MAT_SHAPE);
-        let wk = self.read_quantized_at(&mut cur, &MAT_SHAPE);
-        let wv = self.read_quantized_at(&mut cur, &MAT_SHAPE);
-        let wo = self.read_quantized_at(&mut cur, &MAT_SHAPE);
-        let norm2 = self.read_fp32_at(&mut cur, &NORM_SHAPE);
-        let w1 = self.read_quantized_at(&mut cur, &W1_SHAPE);
-        let w2 = self.read_quantized_at(&mut cur, &W2_SHAPE);
-
-        LayerSlices {
-            norm1,
-            wq,
-            wk,
-            wv,
-            wo,
-            norm2,
-            w1,
-            w2,
-        }
+        parse_layer_section(&self.raw[self.layer_offsets[layer_idx]..])
     }
 
     pub fn get_final_slices(&self) -> (Fp32Slice<'a>, QuantizedSlice<'a>) {
-        let mut cur = self.final_offset;
-        static NORM_SHAPE: [usize; 1] = [48];
-        static HEAD_SHAPE: [usize; 2] = [128, 48];
-        let norm = self.read_fp32_at(&mut cur, &NORM_SHAPE);
-        let head = self.read_quantized_at(&mut cur, &HEAD_SHAPE);
-        (norm, head)
+        parse_final_section(&self.raw[self.final_offset..])
     }
 
     pub fn total_payload_bytes(&self) -> usize {
         self.raw.len()
     }
-}
 
-pub struct LayerSlices<'a> {
-    pub norm1: Fp32Slice<'a>,
-    pub wq: QuantizedSlice<'a>,
-    pub wk: QuantizedSlice<'a>,
-    pub wv: QuantizedSlice<'a>,
-    pub wo: QuantizedSlice<'a>,
-    pub norm2: Fp32Slice<'a>,
-    pub w1: QuantizedSlice<'a>,
-    pub w2: QuantizedSlice<'a>,
+    /// Byte ranges of the independently sealable sections, in order: embeddings, each
+    /// layer, then the final norm and head. Together they cover everything after the
+    /// 32-byte header.
+    pub fn section_ranges(&self) -> Vec<(usize, usize)> {
+        let mut starts = vec![self.embedding_offset];
+        starts.extend(self.layer_offsets.iter().copied());
+        starts.push(self.final_offset);
+        let mut ranges = Vec::with_capacity(starts.len());
+        for (i, &start) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).copied().unwrap_or(self.raw.len());
+            ranges.push((start, end));
+        }
+        ranges
+    }
 }
